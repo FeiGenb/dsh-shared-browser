@@ -1,0 +1,56 @@
+{
+  "name": "dsh-shared-browser",
+  "version": "0.4.1",
+  "description": "Drive the built-in Browser tab of DeepSeek Harness Desktop with Playwright over CDP: native pixels, shared with the user, real login state.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "playwright",
+    "browser",
+    "cdp",
+    "electron",
+    "shared-browser",
+    "webview"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "FeiGenb"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FeiGenb/dsh-shared-browser.git"
+  },
+  "homepage": "https://github.com/FeiGenb/dsh-shared-browser#readme",
+  "bugs": {
+    "url": "https://github.com/FeiGenb/dsh-shared-browser/issues"
+  },
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.2-rc.5 <0.3.0"
+  },
+  "dependencies": {
+    "playwright-core": "^1.65.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

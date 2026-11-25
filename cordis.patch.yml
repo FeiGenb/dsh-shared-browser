@@ -1,0 +1,5 @@
+# dsh-shared-browser: host-plane tools that drive the desktop app's built-in
+# Browser tab through CDP (app must run with --remote-debugging-port=9223).
+- insert:
+    - id: dsh-shared-browser
+      name: 'dsh-shared-browser'
