@@ -1,6 +1,6 @@
 {
   "name": "dsh-shared-browser",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Drive the built-in Browser tab of DeepSeek Harness Desktop with Playwright over CDP: native pixels, shared with the user, real login state.",
   "type": "module",
   "main": "index.js",
