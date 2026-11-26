@@ -1,7 +1,7 @@
 {
   "name": "dsh-shared-browser",
   "version": "0.6.0",
-  "description": "Turnkey browser for DeepSeek Harness: a shared Browser tab (same window the user sees) with an agent-facing tool surface, element comments, console/network capture, screenshots, region screenshots and a built-in DevTools panel.",
+  "description": "Turnkey browser for DeepSeek Harness: a shared Browser tab plus an external Edge/Chrome channel, with an agent-facing tool surface, element comments, console/network capture, screenshots, region screenshots and a built-in DevTools panel.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -30,6 +30,10 @@
     "dsh-plugin",
     "browser",
     "webview",
+    "external-browser",
+    "cdp",
+    "msedge",
+    "chrome",
     "devtools",
     "screenshot",
     "comment",

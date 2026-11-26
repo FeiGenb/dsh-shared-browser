@@ -2,7 +2,7 @@
 
 把 **DeepSeek Harness 桌面版**右侧栏的浏览器页签升级成一台真正的集成浏览器：地址栏、缩放、页内查找、设备仿真、
 历史/收藏、网站权限、清除存储、内置 DevTools 面板，外加 **截图 / 区域截图 / 元素评论 / 控制台日志直接进聊天**，
-以及 26 个让 Agent 操作**同一个页面**的 `bb_*` 工具。
+以及 28 个让 Agent 操作**同一个页面**的 `bb_*` 工具；遇到 Cloudflare 一类人机验证时，插件会明确让 Agent 停手并交还给你。
 
 用户看到的就是 Agent 操作的那一个页面：同一份登录态、同一份页面状态，中途可以人工登录、过人机验证、随手点。
 
@@ -57,6 +57,11 @@ Agent ─┘        ▲
 外部通道的页签 id 形如 `ext:<id>`，其余工具（`bb_snapshot` / `bb_text` / `bb_click` / `bb_screenshot` / `bb_console` …）会按 id 自动路由；侧栏会出现一个「外部浏览器」镜面页签，实时显示画面并把点击、滚轮转发回真实窗口。
 
 设置写在 `$DSH_HOME/shared-browser/settings.json`：`channel`、`browser`（`msedge`/`chrome`）、`profileDir`、`autoLaunch`。外部浏览器使用独立 profile（默认 `$DSH_HOME/shared-browser/profiles/<browser>`），登录态可跨 DSH 重启保留。
+
+### 人机验证（Cloudflare / DataDome）
+
+内置页签撞上挑战页时，工具会返回 `wall: true` 和一条固定提示：**不要**尝试完成或绕过人机验证、**不要**点验证控件，而是把页面交给用户。
+`autoLaunch` 打开时，插件会自动关掉内置页签并在外部浏览器窗口打开同一地址，由你亲自完成验证；外部通道使用独立的持久 profile，验证结果会留在那里。
 
 ## Agent 工具（28 个）
 

@@ -3,7 +3,7 @@
 A browser for **DeepSeek Harness desktop**: it upgrades the sidebar browser tab into a real integrated browser
 (address bar, zoom, find-in-page, device emulation, history/bookmarks, site permissions, storage clearing and a
 built-in DevTools panel) and adds **screenshots, region screenshots, element comments and console logs that go
-straight into the chat draft**, plus 26 `bb_*` tools that let the agent drive **the same page the user is looking at**.
+straight into the chat draft**, plus 28 `bb_*` tools that let the agent drive **the same page the user is looking at**. When a Cloudflare-style verification wall appears, the tools tell the agent to stop and hand the page back to you.
 
 One page, one session: the user can log in, solve a captcha or click around while the agent works, and the agent
 sees exactly that state.
@@ -59,6 +59,11 @@ The in-app tab is an Electron `<webview>`: it lives in the sidebar and supports 
 External tabs are addressed as `ext:<id>`; every other tool (`bb_snapshot`, `bb_click`, `bb_screenshot`, `bb_console` …) routes on that id. The sidebar shows an "External browser" mirror that polls frames and forwards clicks and wheel events to the real window.
 
 Settings live in `$DSH_HOME/shared-browser/settings.json`: `channel`, `browser` (`msedge`/`chrome`), `profileDir`, `autoLaunch`. The external profile defaults to `$DSH_HOME/shared-browser/profiles/<browser>` so logins survive restarts.
+
+### Verification walls (Cloudflare / DataDome)
+
+When the in-app tab hits a challenge page the tools return `wall: true` with a fixed instruction: **do not** try to pass or bypass the check and **do not** click the verification widget — hand the page back to the user.
+With `autoLaunch` on, the plugin closes the in-app tab and reopens the same address in the external browser window so you can complete the check yourself; the external channel keeps a persistent profile, so the result sticks.
 
 ## Agent tools (28)
 

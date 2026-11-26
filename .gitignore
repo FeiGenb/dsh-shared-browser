@@ -6,3 +6,4 @@ app.asar.bak-*
 .env*
 *.key
 *.pem
+/AGENTS.md
