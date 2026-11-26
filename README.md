@@ -45,7 +45,22 @@ falls back to the DSH built-in browser.
 Screenshots, region captures, element comments and console excerpts land in the **current session's composer**
 as a quote plus an image or text block. Nothing is sent for you — edit and send it, or let the agent read it.
 
-## Agent tools (26)
+## Two channels: in-app tab / your own browser
+
+The in-app tab is an Electron `<webview>`: it lives in the sidebar and supports screenshots and element comments, but **its session is not persistent** and Cloudflare-class walls reject its user agent. When a real browser is needed the plugin can hand the same address to the local Edge/Chrome:
+
+| Situation | How |
+| --- | --- |
+| Force the real browser | `bb_open { url, channel: "external" }` or `bb_external { action: "launch", url }` |
+| Make it the default | `bb_settings { action: "set", channel: "external" }` |
+| Auto-switch on a wall | On by default: when the in-app tab detects a challenge it is closed and the page reopens externally (`bb_settings { action: "set", autoLaunch: false }` disables it) |
+| Inspect / stop it | `bb_external { action: "status" }` / `{ action: "close" }` |
+
+External tabs are addressed as `ext:<id>`; every other tool (`bb_snapshot`, `bb_click`, `bb_screenshot`, `bb_console` …) routes on that id. The sidebar shows an "External browser" mirror that polls frames and forwards clicks and wheel events to the real window.
+
+Settings live in `$DSH_HOME/shared-browser/settings.json`: `channel`, `browser` (`msedge`/`chrome`), `profileDir`, `autoLaunch`. The external profile defaults to `$DSH_HOME/shared-browser/profiles/<browser>` so logins survive restarts.
+
+## Agent tools (28)
 
 | Tool | Purpose |
 | --- | --- |
@@ -63,6 +78,8 @@ as a quote plus an image or text block. Nothing is sent for you — edit and sen
 | `bb_devtools` / `bb_open_devtools_native` | panel state / probe native CDP |
 | `bb_storage` / `bb_permissions` / `bb_history` | storage, permission policy, history |
 | `bb_add_to_chat` | put a screenshot / region / element / console log in the composer |
+| `bb_external` | Detect, launch and close the local Edge/Chrome over CDP. |
+| `bb_settings` | Read or change channel, external browser, profile folder, auto-switch. |
 
 Tools and UI share one channel: the host sends commands over SSE, the tab executes them and reports back.
 When no tab is open the tools say so explicitly. Once a comment is submitted, `bb_comments` returns its

@@ -43,7 +43,22 @@ Agent ─┘        ▲
 截图、区域截图、元素评论、控制台日志都会以「引用条 + 图片/文本」的形式落在**当前会话的输入框**里，
 不会替你发送；你可以改完再发，Agent 也能直接读到元素的选择器、文本与你的评论。
 
-## Agent 工具（26 个）
+## 双通道：内置页签 / 你的浏览器
+
+内置页签是 Electron 的 `<webview>`：同屏、可截图、可评论，但**会话不持久**，且 Cloudflare 一类防护会拒绝它的 UA。需要真实浏览器时，插件可以把同一地址交给本机的 Edge/Chrome：
+
+| 场景 | 做法 |
+| --- | --- |
+| 明确要用真浏览器 | `bb_open { url, channel: "external" }`，或 `bb_external { action: "launch", url }` |
+| 让外部通道成为默认 | `bb_settings { action: "set", channel: "external" }` |
+| 遇到人机验证自动切换 | 默认开启：内置页签识别到 CF 类挑战时，自动关掉它并在外部浏览器打开同一地址（`bb_settings { action: "set", autoLaunch: false }` 可关闭） |
+| 查看 / 关闭外部通道 | `bb_external { action: "status" }` / `{ action: "close" }` |
+
+外部通道的页签 id 形如 `ext:<id>`，其余工具（`bb_snapshot` / `bb_text` / `bb_click` / `bb_screenshot` / `bb_console` …）会按 id 自动路由；侧栏会出现一个「外部浏览器」镜面页签，实时显示画面并把点击、滚轮转发回真实窗口。
+
+设置写在 `$DSH_HOME/shared-browser/settings.json`：`channel`、`browser`（`msedge`/`chrome`）、`profileDir`、`autoLaunch`。外部浏览器使用独立 profile（默认 `$DSH_HOME/shared-browser/profiles/<browser>`），登录态可跨 DSH 重启保留。
+
+## Agent 工具（28 个）
 
 | 工具 | 作用 |
 | --- | --- |
@@ -61,6 +76,8 @@ Agent ─┘        ▲
 | `bb_devtools` / `bb_open_devtools_native` | 内置面板状态 / 探测外部 CDP |
 | `bb_storage` / `bb_permissions` / `bb_history` | 存储、权限策略、历史 |
 | `bb_add_to_chat` | 把截图 / 区域 / 元素 / 控制台日志放进输入框 |
+| `bb_external` | 探测 / 启动 / 关闭本机 Edge、Chrome（CDP，真实指纹） |
+| `bb_settings` | 读改默认通道、外部浏览器、profile 目录、自动切换 |
 
 工具与 UI 共用一条通路：宿主把命令经 SSE 下发给页签，页签执行后回传结果。用户不在页签上时，
 工具会明确提示“先打开 Browser 页签”。评论一旦提交，Agent 用 `bb_comments` 就能读到

@@ -21,11 +21,12 @@
  * @module dsh-shared-browser
  */
 
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Hub, BridgeError, ROUTE_BASE, fence, readJson, replyError, replyJson } from './lib/bridge.mjs'
+import { ExternalBrowser, detectBrowsers, profileRoot } from './lib/external.mjs'
 
 export const name = 'dsh-shared-browser'
 export const inject = ['tools']
@@ -43,6 +44,28 @@ const json = () => ({
 const present = (title, args) => ({ card: 'generic', title, kind: 'other', rawInput: args || {} })
 
 /** Directory where screenshots and captured payloads are stored. */
+const SETTINGS_FILE = 'settings.json'
+const settingsRoot = () => join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'shared-browser')
+
+/** Read the small JSON settings file; defaults keep the in-app browser. */
+async function readSettings() {
+  try {
+    const raw = await readFile(join(settingsRoot(), SETTINGS_FILE), 'utf8')
+    const parsed = JSON.parse(raw)
+    return parsed !== null && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+/** Persist a partial settings patch. */
+async function writeSettings(patch) {
+  const next = { ...(await readSettings()), ...patch }
+  await mkdir(settingsRoot(), { recursive: true })
+  await writeFile(join(settingsRoot(), SETTINGS_FILE), `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+  return next
+}
+
 function attachmentsRoot() {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
   return join(home, 'shared-browser', 'attachments')
@@ -96,6 +119,10 @@ async function storeCapture(capture, kind) {
  */
 export function apply(ctx) {
   const hub = new Hub({ attachmentsDir: attachmentsRoot() })
+  /* Real Chromium channel: the user's own Edge/Chrome over CDP, used when the
+     built-in webview cannot do the job (Cloudflare-class challenges, logins
+     that must survive restarts, downloads, DevTools). */
+  const external = new ExternalBrowser(() => {})
   /** @type {Array<() => void>} */
   const disposers = []
 
@@ -176,6 +203,44 @@ export function apply(ctx) {
       }))
     }
 
+    /* The sidebar mirror polls these two routes: a PNG of the real page and a
+       channel for pointer/keyboard events coming back from the pane. */
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_BASE}/external/frame`,
+      handler: route(async (req, res) => {
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const tabId = url.searchParams.get('tab') ?? ''
+        const capture = await external.command('screenshot', {}, tabId)
+        const bytes = Buffer.from(String(capture.dataUrl ?? '').split(',')[1] ?? '', 'base64')
+        if (bytes.length === 0) { replyError(res, 409, '外部页签没有画面。', 'empty'); return }
+        res.writeHead(200, { 'content-type': capture.mime ?? 'image/png', 'cache-control': 'no-store', 'content-length': bytes.length })
+        res.end(bytes)
+      }),
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_BASE}/external/command`,
+      handler: route(async (req, res) => {
+        if (req.method !== 'POST') { replyError(res, 405, 'POST only', 'method'); return }
+        const body = await readJson(req)
+        const tabId = String(body.tab ?? '')
+        const value = await run(String(body.op ?? ''), { ...(body.args ?? {}), tabId })
+        replyJson(res, { ok: true, value })
+      }),
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_BASE}/external/input`,
+      handler: route(async (req, res) => {
+        if (req.method !== 'POST') { replyError(res, 405, 'POST only', 'method'); return }
+        const body = await readJson(req)
+        replyJson(res, { ok: true, ...(await external.input(String(body.tab ?? ''), body)) })
+      }),
+    }))
+
     disposers.push(webServer.register({
       kind: 'exact',
       path: `${ROUTE_BASE}/attachment`,
@@ -235,6 +300,51 @@ export function apply(ctx) {
 
   const tabArg = { type: 'string', description: 'Tab id from bb_tabs. Defaults to the active tab.' }
 
+  /** Bot walls that never clear inside an Electron webview. */
+  const CHALLENGE = /请稍候|正在进行安全验证|访问暂时受限|Just a moment|Verify you are human|challenge-platform|\bcf-\w+/i
+
+  /**
+   * True when the built-in tab is sitting on a challenge page.
+   * @param {unknown} opened - result of the built-in open command.
+   * @returns {Promise<boolean>} whether the page is a bot wall.
+   */
+  const looksLikeChallenge = async (opened) => {
+    const tabId = opened !== null && typeof opened === 'object' ? opened.tabId : null
+    const title = String(opened?.title ?? '')
+    if (CHALLENGE.test(title) === true) return true
+    const probe = await hub.command('text', { tabId, maxChars: 600 }, { timeoutMs: 8000 }).catch(() => null)
+    const text = String(probe?.text ?? '')
+    return text !== '' && CHALLENGE.test(text)
+  }
+
+  /**
+   * Move a walled page into the user's real browser, mirror it into the sidebar,
+   * and report the new tab.
+   * @param {string} target - address that hit the wall.
+   * @returns {Promise<object>} external tab descriptor.
+   */
+  /** Compare addresses ignoring a trailing slash, which Edge adds on its own. */
+  const normaliseUrl = value => String(value ?? '').replace(/\/+$/, '')
+  /** Pick the tab that actually shows the target, else the newest one. */
+  const pickTab = (tabs, target) => tabs.find(entry => normaliseUrl(entry.url) === normaliseUrl(target)) ?? tabs[tabs.length - 1]
+
+  const handOff = async (target) => {
+    const state = await external.ensure({ url: target })
+    const tabs = await external.listTabs()
+    const tab = pickTab(tabs, target)
+    const tabId = tab === undefined ? 'ext:unknown' : `ext:${tab.id}`
+    hub.command('ensure', { url: target, external: tabId }, { timeoutMs: 8000 }).catch(() => {})
+    return { channel: 'external', handoff: 'challenge', tabId, url: tab?.url ?? target, title: tab?.title ?? '', browser: state.browser?.name ?? null, note: '内置浏览器被 Cloudflare 类防护拦截，已自动切换到外部浏览器。' }
+  }
+
+  /** Route a command to the external channel when the tab id says so. */
+  const isExternal = tabId => typeof tabId === 'string' && tabId.startsWith('ext:')
+  const run = (op, args = {}, options) => {
+    const tabId = args !== null && typeof args === 'object' ? args.tabId : undefined
+    if (isExternal(tabId)) return external.command(op, args, tabId)
+    return hub.command(op, args, options)
+  }
+
   tool('bb_status',
     'Read the shared-browser state: whether a Browser tab is attached, every open tab, and how much console/network/comment data is held. Read-only; start here when something looks disconnected.',
     {},
@@ -251,7 +361,11 @@ export function apply(ctx) {
     },
     async (a) => {
       const action = a.action ?? 'list'
-      if (action === 'list') return { tabs: hub.tabs, activeTabId: hub.activeTabId }
+      if (action === 'list') {
+        const externalTabs = external.running === true ? (await external.command('tabs', {}).catch(() => ({ tabs: [] }))).tabs : []
+        return { tabs: [...hub.tabs, ...externalTabs], activeTabId: hub.activeTabId, external: external.summary() }
+      }
+      if (isExternal(a.tabId)) return external.command(action === 'activate' ? 'tabs' : action, { tabId: a.tabId, url: a.url })
       const value = await hub.command('tabs', { action, tabId: a.tabId ?? null, url: a.url ?? null, background: a.background === true })
       return value
     },
@@ -263,11 +377,23 @@ export function apply(ctx) {
     {
       url: { type: 'string', description: 'http(s) address to open.' },
       newTab: { type: 'boolean', description: 'Open in a new tab instead of the active one.' },
+      channel: { type: 'string', enum: ['builtin', 'external'], description: 'Which browser drives the page. builtin is the in-app webview; external is the user own Edge/Chrome over CDP, with real fingerprints, persistent logins and working DevTools.' },
       waitMs: { type: 'number', description: 'How long to wait for load. Default 15000.' },
     },
     async (a) => {
       const target = String(a.url ?? '')
       const waitMs = a.waitMs ?? 15000
+      const settings = await readSettings()
+      const channel = a.channel ?? (settings.channel === 'external' ? 'external' : 'builtin')
+      if (channel === 'external') {
+        const state = await external.ensure({ url: target })
+        const tabs = await external.listTabs()
+        const tab = pickTab(tabs, target)
+        const tabId = tab === undefined ? 'ext:unknown' : `ext:${tab.id}`
+        /* Mirror the tab into the sidebar so the user can watch the same page. */
+        hub.command('ensure', { url: target, external: tabId }, { timeoutMs: 8000 }).catch(() => {})
+        return { channel: 'external', tabId, url: tab?.url ?? target, title: tab?.title ?? '', browser: state.browser?.name ?? null, profileDir: state.profileDir }
+      }
       /* Ask the page to open a pane first: the user should not have to open the
          browser before an Agent can use it. */
       const ensured = await hub.command('ensure', { url: target }, { timeoutMs: 8000 }).catch(error => ({ opened: false, reason: String(error && error.message ? error.message : error) }))
@@ -278,14 +404,74 @@ export function apply(ctx) {
         while (Date.now() < deadline) {
           await new Promise(resolve => setTimeout(resolve, 400))
           const tab = hub.status().tabs.find(entry => entry.visible === true)
-          if (tab !== undefined) return { tabId: tab.id, url: tab.url || target, title: tab.title ?? '', opened: true }
+          if (tab !== undefined) {
+            if (settings.autoLaunch !== false && (await looksLikeChallenge({ tabId: tab.id, title: tab.title })) === true) {
+              await hub.command('tabs', { action: 'close', tabId: tab.id }).catch(() => {})
+              return await handOff(target)
+            }
+            return { tabId: tab.id, url: tab.url || target, title: tab.title ?? '', opened: true }
+          }
         }
         return { opened: true, url: target, pending: true }
       }
-      return hub.command('open', { url: target, newTab: a.newTab === true, waitMs }, { timeoutMs: waitMs + 10000 })
+      const opened = await hub.command('open', { url: target, newTab: a.newTab === true, waitMs }, { timeoutMs: waitMs + 10000 })
+      /* Cloudflare-class walls never resolve inside the Electron webview. Hand the
+         page to the user's real browser instead of leaving a dead tab behind. */
+      const wall = await looksLikeChallenge(opened)
+      if (wall === true) {
+        await hub.command('tabs', { action: 'close', tabId: opened?.tabId ?? null }).catch(() => {})
+        if (settings.autoLaunch === false) return { channel: 'builtin', wall: true, ...opened, note: '页面被 Cloudflare 类防护拦截；在 bb_settings 里打开 autoLaunch 可自动切换外部浏览器。' }
+        return await handOff(target)
+      }
+      return opened
     },
     'Open in shared browser',
     ['url'])
+
+  tool('bb_settings',
+    'Read or change how the browser is driven: default channel (builtin|external), preferred external browser, and the profile folder used for persistent logins.',
+    {
+      action: { type: 'string', enum: ['get', 'set'], description: 'Operation. Default get.' },
+      channel: { type: 'string', enum: ['builtin', 'external'], description: 'Default channel for bb_open.' },
+      browser: { type: 'string', enum: ['msedge', 'chrome'], description: 'Preferred external browser.' },
+      profileDir: { type: 'string', description: 'Folder for the external profile. Empty restores the default.' },
+      autoLaunch: { type: 'boolean', description: 'Switch to the external browser automatically when the built-in one hits a bot wall. Default true.' },
+    },
+    async (a) => {
+      if (a.action === 'set') {
+        const patch = {}
+        if (a.channel !== undefined) patch.channel = a.channel
+        if (a.browser !== undefined) patch.browser = a.browser
+        if (a.profileDir !== undefined) patch.profileDir = a.profileDir
+        if (a.autoLaunch !== undefined) patch.autoLaunch = a.autoLaunch === true
+        const settings = await writeSettings(patch)
+        return { settings, path: join(settingsRoot(), SETTINGS_FILE) }
+      }
+      return { settings: await readSettings(), path: join(settingsRoot(), SETTINGS_FILE), profileRoot: profileRoot(), candidates: detectBrowsers() }
+    },
+    'Browser settings')
+
+  tool('bb_external',
+    'Manage the external Chromium channel: report which Edge/Chrome is installed, launch it with a persistent profile, or close it. Use this when a site rejects the built-in browser (Cloudflare-class challenges, downloads, logins that must survive restarts).',
+    {
+      action: { type: 'string', enum: ['status', 'launch', 'close'], description: 'Operation. Default status.' },
+      browser: { type: 'string', enum: ['msedge', 'chrome'], description: 'Preferred browser for launch.' },
+      url: { type: 'string', description: 'Address for action=launch.' },
+    },
+    async (a) => {
+      const action = a.action ?? 'status'
+      if (action === 'launch') {
+        const settings = await readSettings()
+        await external.ensure({ url: a.url ?? 'about:blank', browser: a.browser ?? settings.browser, profileDir: settings.profileDir || undefined })
+        return { launched: true, ...external.summary(), candidates: detectBrowsers() }
+      }
+      if (action === 'close') {
+        await external.shutdown(true)
+        return { running: false }
+      }
+      return { ...external.summary(), candidates: detectBrowsers(), profileRoot: profileRoot() }
+    },
+    'External browser channel')
 
   tool('bb_navigate',
     'Navigate the active tab (or tabId) to an address, with optional back/forward/reload.',
@@ -295,7 +481,7 @@ export function apply(ctx) {
       tabId: tabArg,
       waitMs: { type: 'number', description: 'How long to wait for load. Default 15000.' },
     },
-    async (a) => hub.command('navigate', { ...a }, { timeoutMs: (a.waitMs ?? 15000) + 10000 }),
+    async (a) => run('navigate', { ...a }, { timeoutMs: (a.waitMs ?? 15000) + 10000 }),
     'Navigate shared browser')
 
   tool('bb_snapshot',
@@ -306,7 +492,7 @@ export function apply(ctx) {
       maxChars: { type: 'number', description: 'Budget for the returned text. Default 20000.' },
       maxDepth: { type: 'number', description: 'DOM depth cap. Default 12.' },
     },
-    async (a) => hub.command('snapshot', { ...a }, { timeoutMs: 15000 }),
+    async (a) => run('snapshot', { ...a }, { timeoutMs: 15000 }),
     'Snapshot page')
 
   tool('bb_text',
@@ -316,7 +502,7 @@ export function apply(ctx) {
       selector: { type: 'string', description: 'Optional CSS selector to read instead of the whole page.' },
       maxChars: { type: 'number', description: 'Default 20000.' },
     },
-    async (a) => hub.command('text', { ...a }, { timeoutMs: 15000 }),
+    async (a) => run('text', { ...a }, { timeoutMs: 15000 }),
     'Read page text')
 
   tool('bb_click',
@@ -330,7 +516,7 @@ export function apply(ctx) {
       clickCount: { type: 'number', description: 'Default 1; 2 double-clicks.' },
       tabId: tabArg,
     },
-    async (a) => hub.command('click', { ...a }, { timeoutMs: 15000 }),
+    async (a) => run('click', { ...a }, { timeoutMs: 15000 }),
     'Click in shared browser')
 
   tool('bb_type',
@@ -344,7 +530,7 @@ export function apply(ctx) {
       delayMs: { type: 'number', description: 'Per-character delay. Default 8.' },
       tabId: tabArg,
     },
-    async (a) => hub.command('type', { ...a }, { timeoutMs: 20000 }),
+    async (a) => run('type', { ...a }, { timeoutMs: 20000 }),
     'Type in shared browser',
     ['text'])
 
@@ -354,7 +540,7 @@ export function apply(ctx) {
       keys: { type: 'string', description: 'Key or chord, e.g. "Control+Shift+R".' },
       tabId: tabArg,
     },
-    async (a) => hub.command('press', { ...a }, { timeoutMs: 10000 }),
+    async (a) => run('press', { ...a }, { timeoutMs: 10000 }),
     'Press keys',
     ['keys'])
 
@@ -367,7 +553,7 @@ export function apply(ctx) {
       timeoutMs: { type: 'number', description: 'Default 10000.' },
       tabId: tabArg,
     },
-    async (a) => hub.command('wait', { ...a }, { timeoutMs: (a.timeoutMs ?? 10000) + 5000 }),
+    async (a) => run('wait', { ...a }, { timeoutMs: (a.timeoutMs ?? 10000) + 5000 }),
     'Wait for page state')
 
   tool('bb_eval',
@@ -377,7 +563,7 @@ export function apply(ctx) {
       awaitPromise: { type: 'boolean', description: 'Default true.' },
       tabId: tabArg,
     },
-    async (a) => hub.command('evaluate', { ...a }, { timeoutMs: 20000 }),
+    async (a) => run('evaluate', { ...a }, { timeoutMs: 20000 }),
     'Evaluate in page',
     ['expression'])
 
@@ -390,7 +576,7 @@ export function apply(ctx) {
       tabId: tabArg,
     },
     async (a) => {
-      const capture = await hub.command('screenshot', { ...a }, { timeoutMs: 30000 })
+      const capture = await run('screenshot', { ...a }, { timeoutMs: 30000 })
       return storeCapture(capture, 'screenshot')
     },
     'Screenshot shared browser')
@@ -406,7 +592,7 @@ export function apply(ctx) {
       tabId: tabArg,
     },
     async (a) => {
-      const capture = await hub.command('regionScreenshot', { ...a }, { timeoutMs: 30000 })
+      const capture = await run('regionScreenshot', { ...a }, { timeoutMs: 30000 })
       return storeCapture(capture, 'region')
     },
     'Region screenshot',
@@ -424,7 +610,9 @@ export function apply(ctx) {
     },
     async (a) => {
       const rank = { error: 0, warning: 1, info: 2, debug: 3, verbose: 4 }
-      let entries = hub.console({ level: a.level, limit: a.limit, tabId: a.tabId, since: a.since })
+      let entries = isExternal(a.tabId)
+        ? (await external.command('console', {})).entries ?? []
+        : hub.console({ level: a.level, limit: a.limit, tabId: a.tabId, since: a.since })
       if (typeof a.levelAtLeast === 'string') {
         const floor = rank[a.levelAtLeast] ?? 0
         entries = entries.filter(entry => (rank[entry.level] ?? 9) <= floor)
@@ -442,7 +630,9 @@ export function apply(ctx) {
       filter: { type: 'string', description: 'Substring of the URL.' },
     },
     async (a) => {
-      const entries = hub.network({ limit: a.limit, failedOnly: a.failedOnly === true, filter: a.filter })
+      const entries = isExternal(a.tabId)
+        ? (await external.command('network', { failedOnly: a.failedOnly === true, filter: a.filter })).entries ?? []
+        : hub.network({ limit: a.limit, failedOnly: a.failedOnly === true, filter: a.filter })
       return { count: entries.length, entries }
     },
     'Network log')
@@ -456,7 +646,7 @@ export function apply(ctx) {
       tabId: tabArg,
     },
     async (a) => {
-      const comment = await hub.command('comment', { ...a }, { timeoutMs: 15000 })
+      const comment = await run('comment', { ...a }, { timeoutMs: 15000 })
       hub.ingest({ type: 'comment', comment })
       return comment
     },
@@ -483,7 +673,7 @@ export function apply(ctx) {
       action: { type: 'string', enum: ['find', 'next', 'previous', 'stop'], description: 'Default find.' },
       tabId: tabArg,
     },
-    async (a) => hub.command('find', { ...a }, { timeoutMs: 10000 }),
+    async (a) => run('find', { ...a }, { timeoutMs: 10000 }),
     'Find in page',
     ['text'])
 
@@ -494,7 +684,7 @@ export function apply(ctx) {
       factor: { type: 'number', description: 'For action=set: 0.25 … 5.' },
       tabId: tabArg,
     },
-    async (a) => hub.command('zoom', { ...a }, { timeoutMs: 8000 }),
+    async (a) => run('zoom', { ...a }, { timeoutMs: 8000 }),
     'Zoom page')
 
   tool('bb_devtools',
@@ -504,7 +694,7 @@ export function apply(ctx) {
       panel: { type: 'string', enum: ['console', 'elements', 'network', 'eval'], description: 'Panel to focus.' },
       tabId: tabArg,
     },
-    async (a) => hub.command('devtools', { ...a }, { timeoutMs: 8000 }),
+    async (a) => run('devtools', { ...a }, { timeoutMs: 8000 }),
     'DevTools panel')
 
   tool('bb_storage',
@@ -514,13 +704,13 @@ export function apply(ctx) {
       scope: { type: 'string', enum: ['origin', 'all'], description: 'Default all, matching the menu item.' },
       tabId: tabArg,
     },
-    async (a) => hub.command('storage', { ...a }, { timeoutMs: 15000 }),
+    async (a) => run('storage', { ...a }, { timeoutMs: 15000 }),
     'Site storage')
 
   tool('bb_permissions',
     'Report which site permissions the shared browser grants (camera, microphone, notifications, geolocation, popups, downloads) and why they are refused, plus the site the tab is on.',
     { tabId: tabArg },
-    async (a) => hub.command('permissions', { ...a }, { timeoutMs: 8000 }),
+    async (a) => run('permissions', { ...a }, { timeoutMs: 8000 }),
     'Site permissions')
 
   tool('bb_history',
@@ -530,7 +720,7 @@ export function apply(ctx) {
       query: { type: 'string', description: 'Filter by URL or title substring.' },
       limit: { type: 'number', description: 'Default 50.' },
     },
-    async (a) => hub.command('history', { ...a }, { timeoutMs: 8000 }),
+    async (a) => run('history', { ...a }, { timeoutMs: 8000 }),
     'Browser history')
 
   tool('bb_emulate',
@@ -541,7 +731,7 @@ export function apply(ctx) {
       height: { type: 'number', description: 'Custom height in CSS pixels.' },
       tabId: tabArg,
     },
-    async (a) => hub.command('emulate', { ...a }, { timeoutMs: 10000 }),
+    async (a) => run('emulate', { ...a }, { timeoutMs: 10000 }),
     'Device emulation')
 
   tool('bb_add_to_chat',
@@ -557,7 +747,7 @@ export function apply(ctx) {
       height: { type: 'number', description: 'For kind=region: height.' },
       tabId: tabArg,
     },
-    async (a) => hub.command('addToChat', { ...a }, { timeoutMs: 30000 }),
+    async (a) => run('addToChat', { ...a }, { timeoutMs: 30000 }),
     'Add browser content to chat',
     ['kind'])
 
