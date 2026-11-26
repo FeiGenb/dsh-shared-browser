@@ -86,6 +86,9 @@ selector, `ref`, text, rect and note — the agent can read what the user pointe
   own DevTools panel (console / elements / network / run JS). `bb_open_devtools_native` explains the external CDP
   route.
 - The partition is per workspace and **not persisted**: a DSH restart drops logins, same as the built-in browser.
+- Screenshots need the window in front: when the DSH window is minimised or fully covered, `capturePage`
+  never returns a frame, so the plugin gives up after about six seconds with
+  "Capture failed: bring the DSH window to the front and try again" instead of spinning forever.
 - Not supported yet: multiple windows, bookmark sync, download manager, extensions.
 
 ## Requirements
