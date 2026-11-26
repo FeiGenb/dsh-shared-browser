@@ -300,6 +300,24 @@ export function apply(ctx) {
 
   const tabArg = { type: 'string', description: 'Tab id from bb_tabs. Defaults to the active tab.' }
 
+  /** Built-in tabs known to sit on a challenge page. */
+  const walledTabs = new Set()
+
+  /** Guidance repeated in every result that lands on a bot wall. */
+  const WALL_POLICY = '这是 Cloudflare/DataDome 等防自动程序页面：不要尝试完成或绕过人机验证，也不要点击验证控件。请把情况告诉用户，让用户在弹出的真实浏览器窗口里自行验证，或改用其它数据源。'
+
+  /**
+   * Flag a challenge page from its title or body text.
+   * @param {object|null} value - snapshot or text result.
+   * @returns {{wall: boolean, hint: string}} wall flag plus guidance.
+   */
+  const wallInfo = (value) => {
+    const title = String(value?.title ?? '')
+    const body = String(value?.text ?? '')
+    const wall = CHALLENGE.test(title) === true || CHALLENGE.test(body) === true
+    return { wall, hint: WALL_POLICY }
+  }
+
   /** Bot walls that never clear inside an Electron webview. */
   const CHALLENGE = /请稍候|正在进行安全验证|访问暂时受限|Just a moment|Verify you are human|challenge-platform|\bcf-\w+/i
 
@@ -334,7 +352,7 @@ export function apply(ctx) {
     const tab = pickTab(tabs, target)
     const tabId = tab === undefined ? 'ext:unknown' : `ext:${tab.id}`
     hub.command('ensure', { url: target, external: tabId }, { timeoutMs: 8000 }).catch(() => {})
-    return { channel: 'external', handoff: 'challenge', tabId, url: tab?.url ?? target, title: tab?.title ?? '', browser: state.browser?.name ?? null, note: '内置浏览器被 Cloudflare 类防护拦截，已自动切换到外部浏览器。' }
+    return { channel: 'external', handoff: 'challenge', tabId, url: tab?.url ?? target, title: tab?.title ?? '', browser: state.browser?.name ?? null, note: '内置浏览器被 Cloudflare 类防护拦截，已自动切换到外部浏览器。', hint: `${WALL_POLICY}验证请在已弹出的外部浏览器窗口里由用户完成。` }
   }
 
   /** Route a command to the external channel when the tab id says so. */
@@ -348,7 +366,7 @@ export function apply(ctx) {
   tool('bb_status',
     'Read the shared-browser state: whether a Browser tab is attached, every open tab, and how much console/network/comment data is held. Read-only; start here when something looks disconnected.',
     {},
-    async () => ({ version: VERSION, ...hub.status(), attachmentsDir: attachmentsRoot() }),
+    async () => ({ version: VERSION, ...hub.status(), attachmentsDir: attachmentsRoot(), wallPolicy: WALL_POLICY }),
     'Shared browser status')
 
   tool('bb_tabs',
@@ -373,7 +391,7 @@ export function apply(ctx) {
     [])
 
   tool('bb_open',
-    'Open an address in the shared browser and wait until it is usable. If no Browser tab exists yet, this opens one. Returns the tab id, final URL and title.',
+    'Open an address in the shared browser and wait until it is usable. If no Browser tab exists yet, this opens one. Returns the tab id, final URL and title. Cloudflare-class challenges are handed to the external browser automatically; never try to solve the verification, ask the user to finish it in the real window.',
     {
       url: { type: 'string', description: 'http(s) address to open.' },
       newTab: { type: 'boolean', description: 'Open in a new tab instead of the active one.' },
@@ -420,7 +438,10 @@ export function apply(ctx) {
       const wall = await looksLikeChallenge(opened)
       if (wall === true) {
         await hub.command('tabs', { action: 'close', tabId: opened?.tabId ?? null }).catch(() => {})
-        if (settings.autoLaunch === false) return { channel: 'builtin', wall: true, ...opened, note: '页面被 Cloudflare 类防护拦截；在 bb_settings 里打开 autoLaunch 可自动切换外部浏览器。' }
+        if (settings.autoLaunch === false) {
+          if (typeof opened?.tabId === 'string') walledTabs.add(opened.tabId)
+          return { channel: 'builtin', wall: true, ...opened, hint: WALL_POLICY, note: '页面被 Cloudflare 类防护拦截；在 bb_settings 里打开 autoLaunch 可自动切换外部浏览器。' }
+        }
         return await handOff(target)
       }
       return opened
@@ -485,28 +506,50 @@ export function apply(ctx) {
     'Navigate shared browser')
 
   tool('bb_snapshot',
-    'Read the page as an accessibility-style tree with stable element refs (e1, e2, …). Use the refs with bb_click/bb_type instead of guessing selectors.',
+    'Read the page as an accessibility-style tree with stable element refs (e1, e2, …). Use the refs with bb_click/bb_type instead of guessing selectors. A result carrying wall:true is an anti-bot challenge: never try to solve it.',
     {
       tabId: tabArg,
       interactiveOnly: { type: 'boolean', description: 'Only interactive and labeled elements. Default false.' },
       maxChars: { type: 'number', description: 'Budget for the returned text. Default 20000.' },
       maxDepth: { type: 'number', description: 'DOM depth cap. Default 12.' },
     },
-    async (a) => run('snapshot', { ...a }, { timeoutMs: 15000 }),
+    async (a) => {
+      try {
+        const value = await run('snapshot', { ...a }, { timeoutMs: 15000 })
+        return { ...value, ...wallInfo(value) }
+      } catch (error) {
+        const tabId = typeof a.tabId === 'string' ? a.tabId : hub.status().activeTabId
+        const tab = hub.status().tabs.find(entry => entry.id === tabId)
+        const walled = walledTabs.has(tabId) || CHALLENGE.test(String(tab?.title ?? '')) === true
+        const message = error instanceof Error ? error.message : String(error)
+        throw new Error(walled === true ? `${message} ${WALL_POLICY}` : message)
+      }
+    },
     'Snapshot page')
 
   tool('bb_text',
-    'Extract readable text from the page (main content first), optionally limited to one element.',
+    'Extract readable text from the page (main content first), optionally limited to one element. A result carrying wall:true is an anti-bot challenge: never try to solve it.',
     {
       tabId: tabArg,
       selector: { type: 'string', description: 'Optional CSS selector to read instead of the whole page.' },
       maxChars: { type: 'number', description: 'Default 20000.' },
     },
-    async (a) => run('text', { ...a }, { timeoutMs: 15000 }),
+    async (a) => {
+      try {
+        const value = await run('text', { ...a }, { timeoutMs: 15000 })
+        return { ...value, ...wallInfo(value) }
+      } catch (error) {
+        const tabId = typeof a.tabId === 'string' ? a.tabId : hub.status().activeTabId
+        const tab = hub.status().tabs.find(entry => entry.id === tabId)
+        const walled = walledTabs.has(tabId) || CHALLENGE.test(String(tab?.title ?? '')) === true
+        const message = error instanceof Error ? error.message : String(error)
+        throw new Error(walled === true ? `${message} ${WALL_POLICY}` : message)
+      }
+    },
     'Read page text')
 
   tool('bb_click',
-    'Click an element in the shared browser: by ref from bb_snapshot, by CSS selector, or at viewport coordinates. The user sees the real click.',
+    'Click an element in the shared browser: by ref from bb_snapshot, by CSS selector, or at viewport coordinates. The user sees the real click. Do not use it on anti-bot verification widgets (Cloudflare, DataDome, I-am-not-a-robot): hand those to the user instead.',
     {
       ref: { type: 'string', description: 'Element ref from bb_snapshot (e12).' },
       selector: { type: 'string', description: 'CSS selector, or text= prefix for text match.' },
@@ -516,7 +559,11 @@ export function apply(ctx) {
       clickCount: { type: 'number', description: 'Default 1; 2 double-clicks.' },
       tabId: tabArg,
     },
-    async (a) => run('click', { ...a }, { timeoutMs: 15000 }),
+    async (a) => {
+      const tabId = typeof a.tabId === 'string' ? a.tabId : hub.status().activeTabId
+      if (walledTabs.has(tabId) === true) return { clicked: false, wall: true, hint: WALL_POLICY }
+      return run('click', { ...a }, { timeoutMs: 15000 })
+    },
     'Click in shared browser')
 
   tool('bb_type',
@@ -577,7 +624,10 @@ export function apply(ctx) {
     },
     async (a) => {
       const capture = await run('screenshot', { ...a }, { timeoutMs: 30000 })
-      return storeCapture(capture, 'screenshot')
+      const value = await storeCapture(capture, 'screenshot')
+      const tabId = typeof a.tabId === 'string' ? a.tabId : hub.status().activeTabId
+      const title = String(hub.status().tabs.find(entry => entry.id === tabId)?.title ?? '')
+      return { ...value, ...wallInfo({ title }) }
     },
     'Screenshot shared browser')
 
