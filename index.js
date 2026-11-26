@@ -1,726 +1,567 @@
 /**
- * dsh-shared-browser — drive DSH Desktop's own Browser tab with Playwright over CDP.
+ * dsh-shared-browser — one browser, shared by the user and the agent.
  *
- * The desktop app embeds each Browser tab as an Electron <webview>. When the app
- * is started with `--remote-debugging-port=9223`, that guest shows up as a CDP
- * target of type "webview". Playwright's connectOverCDP ignores that type, so
- * `ensurePatch()` applies one env-gated line change to the installed
- * playwright-core copy (backup kept next to it, idempotent, re-applied on
- * upgrade). With it, the tab behaves like an ordinary Playwright page:
- * goto / click / type / keyboard / evaluate / screenshot, all with native
- * pixels because it is the real on-screen webview.
+ * Two halves, one product:
  *
- * There is no panel: the display IS the built-in Browser tab the user sees.
+ * - **Client half** (`lib/client.cjs`) takes over DSH's own Browser tab through
+ *   the public `sidebarRightTabs` registry (`priority: 'extension'`, same
+ *   `kind: 'browser'`), then draws the full desktop-browser chrome around the
+ *   Electron `<webview>` the shell already owns: back/forward/reload, zoom,
+ *   find-in-page, device emulation, history, bookmarks, permissions, storage
+ *   clearing, screenshots, region screenshots, element picking, element
+ *   comments, a DevTools panel, and the context menu the product menu shows.
+ *
+ * - **Host half** (this file) exposes the same browser to the agent as tools,
+ *   relays commands over an authenticated SSE/POST bridge, and owns everything
+ *   that must survive a tab: the console log, the network log, element
+ *   comments, and screenshots written to disk.
+ *
+ * Because the tab type is a registration and the bridge is a route pair, the
+ * bundle needs no edit to DSH: unloading it restores the stock browser.
  * @module dsh-shared-browser
  */
 
-import { existsSync, mkdirSync, readFileSync, copyFileSync, writeFileSync, readdirSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
-import { tmpdir, homedir } from 'node:os'
-import { fileURLToPath } from 'node:url'
-import { createRequire } from 'node:module'
-import { spawnSync } from 'node:child_process'
-import { locateApp, archiveState } from './lib/locate.mjs'
-import { installShortcut, shortcutState, uninstallShortcut } from './lib/shortcut.mjs'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { Hub, BridgeError, ROUTE_BASE, fence, readJson, replyError, replyJson } from './lib/bridge.mjs'
 
 export const name = 'dsh-shared-browser'
 export const inject = ['tools']
 
-const ENDPOINT = process.env.DSH_CDP || 'http://127.0.0.1:9223'
-const PATCH_ENV = 'DSH_BUILTIN_WEBVIEW_AS_PAGE'
-const TASK_NAME = 'dsh-shared-browser-arm'
+const VERSION = '0.5.0'
+const ATTACHMENT_PREFIX = `${ROUTE_BASE}/attachment?path=`
 
-// Must be set before playwright-core is imported, so the patched branch runs.
-process.env[PATCH_ENV] = '1'
+/** Tool output envelope: JSON text plus a generic card. */
+const json = () => ({
+  schema: { type: 'object', additionalProperties: true },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value ?? null) }],
+})
 
-const require = createRequire(import.meta.url)
+/** Present-call descriptor for the tool card. */
+const present = (title, args) => ({ card: 'generic', title, kind: 'other', rawInput: args || {} })
 
-const ANCHOR =
-  'const treatOtherAsPage = targetInfo.type === "other" && process.env.PW_CHROMIUM_ATTACH_TO_OTHER;'
-const PATCHED =
-  'const treatOtherAsPage = (targetInfo.type === "other" && process.env.PW_CHROMIUM_ATTACH_TO_OTHER) || (targetInfo.type === "webview" && process.env.DSH_BUILTIN_WEBVIEW_AS_PAGE === "1");'
-
-/** Ensure the installed playwright-core attaches to `webview` targets. */
-function ensurePatch() {
-  let bundle
-  try {
-    bundle = resolve(process.cwd(), require.resolve('playwright-core/package.json'))
-  } catch (error) {
-    throw new Error('playwright-core is not installed for this plugin: ' + error.message)
-  }
-  const file = join(dirname(bundle), 'lib', 'coreBundle.js')
-  if (!existsSync(file)) throw new Error('playwright-core layout changed (no lib/coreBundle.js): ' + file)
-  const source = readFileSync(file, 'utf8')
-  if (source.includes(PATCHED)) return { patched: 'already', file }
-  if (!source.includes(ANCHOR)) {
-    throw new Error('playwright-core patch anchor not found (version changed?): ' + file)
-  }
-  if (!existsSync(file + '.orig')) copyFileSync(file, file + '.orig')
-  writeFileSync(file, source.replace(ANCHOR, PATCHED), 'utf8')
-  return { patched: 'applied', file }
+/** Directory where screenshots and captured payloads are stored. */
+function attachmentsRoot() {
+  const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  return join(home, 'shared-browser', 'attachments')
 }
 
-/** node.exe binaries shipped with DSH (the host may not have node on PATH). */
-function runtimeNodes() {
-  const found = []
-  const homes = [process.env.DSH_HOME, join(homedir(), '.dsh')].filter(Boolean)
-  for (const home of homes) {
-    const root = join(home, 'dsh-runtimes')
-    let names = []
-    try {
-      names = readdirSync(root)
-    } catch {
-      continue
-    }
-    for (const name of names) {
-      const candidate = join(root, name, 'dependencies', 'node', 'bin', 'node.exe')
-      if (existsSync(candidate)) found.push(candidate)
-    }
-  }
-  return found
-}
-
-/** A real node.exe for the watchdog (the host may run as Electron with ELECTRON_RUN_AS_NODE). */
-function nodeExe() {
-  const candidates = [
-    process.env.DSH_NODE,
-    process.env.DSH_DESKTOP_PRIMARY_RUNTIME_DIR
-      ? join(process.env.DSH_DESKTOP_PRIMARY_RUNTIME_DIR, 'dependencies', 'node', 'bin', 'node.exe')
-      : null,
-    process.env.DSH_HOME
-      ? join(process.env.DSH_HOME, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'node', 'bin', 'node.exe')
-      : null,
-    /node\.exe$/i.test(process.execPath) ? process.execPath : null,
-    ...runtimeNodes(),
-    'node',
-  ].filter(Boolean)
-  for (const candidate of candidates) {
-    if (candidate === 'node') return candidate
-    if (existsSync(candidate)) return candidate
-  }
-  return 'node'
-}
-
-let patchState = null
-function patchOnce() {
-  if (patchState === null) patchState = ensurePatch()
-  return patchState
-}
-
-/** Load playwright-core without going through its package entry.
- *
- * DSH's CommonJS hook rewrites `require('./lib/coreBundle')` inside
- * playwright-core/index.js, which leaves `.inprocess` undefined and makes every
- * call fail with "Cannot read properties of undefined (reading 'playwright')".
- * Reading the bundled entry by absolute path skips that hook.
- */
-function loadPlaywright() {
-  try {
-    const pkg = require.resolve('playwright-core/package.json')
-    const bundle = require(join(dirname(pkg), 'lib', 'coreBundle.js'))
-    const pw = bundle && bundle.inprocess && bundle.inprocess.playwright
-    if (pw && pw.chromium) return pw
-  } catch { /* fall back below */ }
-  return null
-}
-
-let browserPromise = null
-let chromiumRef = null
-
-async function browser() {
-  patchOnce()
-  if (chromiumRef === null) {
-    const direct = loadPlaywright()
-    const pw = direct || (await import('playwright-core'))
-    chromiumRef = pw.chromium
-  }
-  if (browserPromise === null) {
-    browserPromise = chromiumRef.connectOverCDP(ENDPOINT).catch((error) => {
-      browserPromise = null
-      throw new Error(
-        'cannot reach the DSH desktop app on ' + ENDPOINT + ' (' + error.message + ').\n' +
-        'The app is running without --remote-debugging-port. Run bb_enable once (default mode '
-        + 'rewrites the DSH launcher shortcut, no binary is touched), then open DSH from that '
-        + 'shortcut: every launch from then on carries the port.',
-      )
-    })
-  }
-  return browserPromise
-}
-
-/** Drop the cached connection (call after the app restarts). */
-async function resetBrowser() {
-  const p = browserPromise
-  browserPromise = null
-  if (p !== null) {
-    try { const b = await p; await b.close().catch(() => {}) } catch { /* ignore */ }
-  }
-}
-
-function isWebPage(url) {
-  return /^https?:/i.test(url || '')
-}
-
-/** Find the built-in Browser tab page (optionally one whose URL contains `match`). */
-// The sidebar keeps its address bar in the app shell; typing there creates the
-// WebContentsView we drive. Used when no Browser tab exists yet.
-async function openTabThroughAddressBar(url) {
-  const b = await browser()
-  const pages = []
-  for (const ctx of b.contexts()) for (const page of ctx.pages()) pages.push(page)
-  const shell = pages.find((page) => page.url().startsWith('dsh-app://'))
-  if (!shell) throw new Error('cannot find the app shell page (dsh-app://) to open a Browser tab')
-  const box = shell.locator('input[placeholder="输入 HTTP(S) 地址"]').first()
-  try {
-    await box.waitFor({ state: 'visible', timeout: 5000 })
-  } catch {
-    throw new Error(
-      'no Browser tab and its address bar is not visible. Click the sidebar tab labelled 浏览器 (Ctrl+T) once, then retry.',
-    )
-  }
-  await box.click()
-  await box.fill(url)
-  await box.press('Enter')
-  for (let i = 0; i < 25; i++) {
-    await new Promise((r) => setTimeout(r, 400))
-    const now = []
-    for (const ctx of b.contexts()) for (const page of ctx.pages()) now.push(page)
-    const web = now.filter((page) => isWebPage(page.url()))
-    if (web.length) return web[web.length - 1]
-  }
-  throw new Error('typed the URL into the address bar but no Browser tab appeared; open it manually once.')
-}
-
-async function pickPage(match) {
-  const b = await browser()
-  const pages = []
-  for (const ctx of b.contexts()) for (const page of ctx.pages()) pages.push(page)
-  const web = pages.filter((page) => isWebPage(page.url()))
-  if (web.length === 0) {
-    if (match && /^https?:/i.test(match)) return openTabThroughAddressBar(match)
-    throw new Error(
-      'no web page found in the built-in Browser tab. Open one first: press Ctrl+T in the panel dock ' +
-      '(or click the Browser tab that lists Ctrl+T) and type a URL; bb_open with a URL also creates one.',
-    )
-  }
-  if (match) {
-    const hit = web.find((page) => page.url().includes(match))
-    if (hit) return hit
-    throw new Error('no page whose URL contains ' + JSON.stringify(match) + '; open pages: ' + web.map((p) => p.url()).join(' | '))
-  }
-  return web[web.length - 1]
-}
-
-/** Tag interactive elements in the page and return a compact inventory. */
-async function snapshot(page, limit) {
-  const data = await page.evaluate((cap) => {
-    const seen = new Set()
-    const out = []
-    let n = 0
-    const sel = 'a[href],button,input,textarea,select,summary,[role="button"],[role="link"],[tabindex]:not([tabindex="-1"])'
-    for (const el of document.querySelectorAll(sel)) {
-      const rect = el.getBoundingClientRect()
-      const visible = rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden'
-      if (!visible || seen.has(el)) continue
-      seen.add(el)
-      const ref = 'e' + ++n
-      el.setAttribute('data-bbref', ref)
-      const label = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || '').trim().replace(/\s+/g, ' ').slice(0, 80)
-      const item = { ref, tag: el.tagName.toLowerCase(), label, y: Math.round(rect.top) }
-      if (el.type) item.type = el.type
-      if (el.disabled) item.disabled = true
-      out.push(item)
-      if (out.length >= cap) break
-    }
-    document.querySelectorAll('[data-bbref]').forEach((el) => el.removeAttribute('data-bbref'))
-    // re-tag the ones we kept, so a later click can find them by ref
-    return { items: out, text: document.body ? document.body.innerText.slice(0, 4000) : '' }
-  }, limit || 60)
-  // tag again and keep them until the next snapshot
-  await page.evaluate((items) => {
-    document.querySelectorAll('[data-bbref]').forEach((el) => el.removeAttribute('data-bbref'))
-    const sel = 'a[href],button,input,textarea,select,summary,[role="button"],[role="link"],[tabindex]:not([tabindex="-1"])'
-    const nodes = Array.from(document.querySelectorAll(sel)).filter((el) => {
-      const r = el.getBoundingClientRect()
-      return r.width > 0 && r.height > 0
-    })
-    const byIndex = new Map()
-    nodes.forEach((el, i) => byIndex.set('e' + (i + 1), el))
-    for (const item of items) {
-      const el = byIndex.get(item.ref)
-      if (el) el.setAttribute('data-bbref', item.ref)
-    }
-  }, data.items)
-  return data
-}
-
-function locator(page, target) {
-  if (/^e\d+$/.test(target)) return page.locator('[data-bbref="' + target + '"]').first()
-  return page.locator(target).first()
-}
-
-async function shotDir() {
-  const dir = join(tmpdir(), 'dsh-shared-browser')
-  mkdirSync(dir, { recursive: true })
+/** Ensure the attachments directory exists. @returns {Promise<string>} absolute path. */
+async function ensureAttachments() {
+  const dir = attachmentsRoot()
+  await mkdir(dir, { recursive: true })
   return dir
 }
 
-function pidAlive(pid) {
-  const id = Number(pid)
-  if (!Number.isInteger(id) || id <= 0) return false
-  try {
-    process.kill(id, 0)
-    return true
-  } catch {
-    return false
-  }
+/**
+ * Decode a data URL produced by the browser into raw bytes.
+ * @param {string} dataUrl - `data:image/png;base64,…`.
+ * @returns {{ bytes: Buffer, mime: string, ext: string }} decoded payload.
+ */
+function decodeDataUrl(dataUrl) {
+  const match = /^data:([^;,]+)?(?:;base64)?,(.*)$/su.exec(String(dataUrl ?? ''))
+  if (match === null) throw new BridgeError('截图数据不是合法的 data URL。', 'bad-image')
+  const mime = match[1] ?? 'image/png'
+  const bytes = Buffer.from(match[2], 'base64')
+  const ext = mime === 'image/jpeg' ? 'jpg' : mime === 'image/webp' ? 'webp' : 'png'
+  return { bytes, mime, ext }
 }
 
-const clean = (v) => JSON.parse(JSON.stringify(v ?? null))
-const json = () => ({ schema: { type: 'object', additionalProperties: true }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v ?? null) }] })
-const present = (title, args) => ({ card: 'generic', title, kind: 'other', rawInput: args || {} })
-
-// Arm the patch-mode watchdog. Shared by bb_enable(mode=patch) and autoArm().
-async function armPatch({ port, cdpWaitMs } = {}) {
-  const app = locateApp()
-  if (!app.exeExists) throw new Error('cannot find the desktop app executable: ' + app.exe + ' (set DSH_APP_EXE to override)')
-  if (!app.asarExists) throw new Error('cannot find app.asar: ' + app.asar + ' (set DSH_ASAR_PATH to override)')
-  const p = String(port || new URL(ENDPOINT).port || '9223')
-  const waitMs = Number(cdpWaitMs || 120000)
-  const dir = join(tmpdir(), 'dsh-shared-browser')
-  mkdirSync(dir, { recursive: true })
-  const statusPath = join(dir, 'arm-status.json')
-  const watchdog = join(dirname(fileURLToPath(import.meta.url)), 'lib', 'watchdog.mjs')
-  const launcher = join(dir, 'arm.cmd')
-  const startupDir = join(process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
-  const startupCmd = join(startupDir, 'dsh-shared-browser-arm.cmd')
-  const lines = [
-    '@echo off',
-    'set "DSH_CDP_PORT=' + p + '"',
-    '"' + nodeExe() + '" "' + watchdog + '" --exe "' + app.exe + '" --asar "' + app.asar + '" --port ' + p + ' --status "' + statusPath + '" --cdp-wait-ms ' + waitMs + ' --cleanup "' + startupCmd + '"',
-  ]
-  writeFileSync(launcher, lines.join('\r\n') + '\r\n', 'utf8')
-  const ps =
-    "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'cmd.exe /c \"" +
-    launcher.replace(/'/g, "''") +
-    "\"' } | ForEach-Object { $_.ProcessId }"
-  const res = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', timeout: 30000 })
-  const launcherPid = Number(String(res.stdout || '').trim().split(/\s+/).filter(Boolean).pop())
-  if (res.status !== 0 || !Number.isFinite(launcherPid) || !launcherPid) {
-    throw new Error('could not arm the watchdog: ' + (res.stderr || res.error || 'unknown error') + ' (launcher: ' + launcher + ')')
-  }
-  // Survive a reboot: Windows runs everything in the Startup folder at logon,
-  // which needs no elevation (schtasks ONLOGON is denied on this machine).
-  let startup = null
-  try {
-    mkdirSync(startupDir, { recursive: true })
-    writeFileSync(
-      startupCmd,
-      ['@echo off', 'rem keeps dsh-shared-browser armed across reboots; deletes itself after a patch', ...lines.slice(1), ''].join('\r\n'),
-      'utf8',
-    )
-    startup = startupCmd
-  } catch (error) {
-    startup = 'failed: ' + String(error && error.message || error)
-  }
-
-  // The launch stub exits at once; the watchdog records its own pid in the status file.
-  let pid = launcherPid
-  for (let i = 0; i < 20; i += 1) {
-    await new Promise((r) => setTimeout(r, 150))
-    try {
-      const now = JSON.parse(readFileSync(statusPath, 'utf8'))
-      if (now.state === 'armed' && pidAlive(now.pid)) {
-        pid = now.pid
-        break
-      }
-    } catch {}
-  }
+/**
+ * Persist one browser capture and describe it for the tool result.
+ * @param {{ dataUrl: string, name?: string }} capture - client payload.
+ * @param {string} kind - `screenshot` | `region` | `element`.
+ * @returns {Promise<Record<string, unknown>>} stored file facts.
+ */
+async function storeCapture(capture, kind) {
+  const dir = await ensureAttachments()
+  const { bytes, mime, ext } = decodeDataUrl(capture.dataUrl)
+  const stamp = new Date().toISOString().replace(/[:.]/gu, '-')
+  const base = String(capture.name ?? kind).replace(/[^\w.-]+/gu, '-').slice(0, 40) || kind
+  const file = join(dir, `${stamp}-${base}-${randomUUID().slice(0, 8)}.${ext}`)
+  await writeFile(file, bytes)
   return {
-    armed: true,
-    pid,
-    startup,
-    port: p,
-    asar: app.asar,
-    backupDir: dir,
-    statusPath,
-    launcher,
-    node: nodeExe(),
-    next:
-      'Quit DeepSeek Harness from its tray menu now (closing the window only hides it). The watchdog will back up ' +
-      'app.asar, patch a verified copy, restart the app and wait for CDP on port ' + p + '. If CDP never answers it ' +
-      'restores the backup and starts the app unchanged. Then call bb_status.',
+    path: file,
+    bytes: bytes.length,
+    mime,
+    url: `${ATTACHMENT_PREFIX}${encodeURIComponent(file.slice(dir.length + 1).replace(/\\/gu, '/'))}`,
   }
 }
 
-// Arm on load: the install → one restart sequence is enough, because the restart
-// itself is the exit the watchdog is waiting for. It patches, then starts the app
-// with the switch baked into app.asar, so no shortcut or flag is needed anymore.
-function autoArm() {
-  if (String(process.env.DSH_AUTO_ARM || '').toLowerCase() === 'off') return
-  try {
-    const app = locateApp()
-    if (!app.exeExists || !app.asarExists) return
-    if (archiveState(app.asar).patched) return
-    const statusPath = join(tmpdir(), 'dsh-shared-browser', 'arm-status.json')
-    try {
-      const prev = JSON.parse(readFileSync(statusPath, 'utf8'))
-      if (prev.state === 'armed' && pidAlive(prev.pid) && Date.now() - Date.parse(prev.at) < 6 * 3600 * 1000) return
-    } catch {}
-    armPatch({})
-      .then((info) => console.info('[dsh-shared-browser] auto-armed watchdog pid ' + info.pid + ' on port ' + info.port))
-      .catch((error) => console.warn('[dsh-shared-browser] auto-arm failed: ' + String((error && error.message) || error)))
-  } catch (error) {
-    console.warn('[dsh-shared-browser] auto-arm skipped: ' + String((error && error.message) || error))
-  }
-}
-
+/**
+ * Mount the routes and tools.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ */
 export function apply(ctx) {
-  let patchInfo
-  try {
-    patchInfo = patchOnce()
-    console.info('[dsh-shared-browser] playwright-core patch ' + patchInfo.patched + ' :: ' + patchInfo.file)
-  } catch (error) {
-    console.warn('[dsh-shared-browser] patch failed: ' + error.message)
+  const hub = new Hub({ attachmentsDir: attachmentsRoot() })
+  /** @type {Array<() => void>} */
+  const disposers = []
+
+  // Routes exist only once the Host has a web server. Waiting for the service keeps
+  // the tools usable on carriers without one (a plain CLI session, for example).
+  ctx.inject(['webServer'], (injected) => {
+    const webServer = injected.webServer
+    const origin = (() => {
+      try { return webServer.getOrigin() } catch { return undefined }
+    })()
+
+    /**
+     * Wrap a route handler with the same-origin fence and uniform error replies.
+     * @param {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>} handler - body.
+     * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void} guarded handler.
+     */
+    const route = handler => (req, res) => {
+      const refusal = fence(req, origin)
+      if (refusal !== null) {
+        replyError(res, 403, refusal, 'forbidden')
+        return
+      }
+      handler(req, res).catch((error) => {
+        if (error instanceof BridgeError) replyError(res, 400, error.message, error.code)
+        else replyError(res, 500, error instanceof Error ? error.message : String(error), 'internal')
+      })
+    }
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_BASE}/state`,
+      handler: route(async (_req, res) => {
+        replyJson(res, { ok: true, version: VERSION, ...hub.status() })
+      }),
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_BASE}/events`,
+      handler: route(async (req, res) => {
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        hub.attach(res, { sessionId: url.searchParams.get('sessionId'), version: url.searchParams.get('version') })
+        req.on('close', () => { /* stream close is handled by the response */ })
+      }),
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_BASE}/report`,
+      handler: route(async (req, res) => {
+        if (req.method !== 'POST') { replyError(res, 405, 'POST only', 'method'); return }
+        const type = String(req.headers['content-type'] ?? '')
+        if (!type.toLowerCase().includes('application/json')) {
+          replyError(res, 415, 'report 必须是 application/json。', 'content-type')
+          return
+        }
+        const body = await readJson(req)
+        replyJson(res, hub.ingest(body))
+      }),
+    }))
+
+    // Opt-in debugging hook. It lets a local script drive the same host → client
+    // command path the tools use, without spending a model turn. Never
+    // registered unless the Host process was started with the flag.
+    if (process.env.DSH_SHARED_BROWSER_DEV === '1') {
+      disposers.push(webServer.register({
+        kind: 'exact',
+        path: `${ROUTE_BASE}/debug/command`,
+        handler: route(async (req, res) => {
+          if (req.method !== 'POST') { replyError(res, 405, 'POST only', 'method'); return }
+          const body = await readJson(req)
+          const name = String(body.tool ?? body.op ?? '')
+          const run = tools.get(name)
+          if (run === undefined) throw new BridgeError(`unknown tool: ${name}`, 'tool')
+          const value = await run(body.args ?? {})
+          replyJson(res, { ok: true, value })
+        }),
+      }))
+    }
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: `${ROUTE_BASE}/attachment`,
+      handler: route(async (req, res) => {
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const requested = url.searchParams.get('path') ?? ''
+        const dir = await ensureAttachments()
+        const resolved = join(dir, requested)
+        if (!resolved.startsWith(dir)) { replyError(res, 400, '非法附件路径。', 'path'); return }
+        const { readFile } = await import('node:fs/promises')
+        const bytes = await readFile(resolved).catch(() => null)
+        if (bytes === null) { replyError(res, 404, '附件不存在。', 'missing'); return }
+        const mime = resolved.endsWith('.jpg') ? 'image/jpeg' : resolved.endsWith('.webp') ? 'image/webp' : 'image/png'
+        res.writeHead(200, { 'content-type': mime, 'cache-control': 'no-store', 'content-length': bytes.length })
+        res.end(bytes)
+      }),
+    }))
+
+    injected.effect(() => () => {
+      hub.detach()
+      for (const off of disposers) {
+        try { off() } catch { /* route already gone */ }
+      }
+    }, 'dsh-shared-browser routes')
+  })
+
+  /* ------------------------------------------------------------------ tools */
+
+  /**
+   * Register one agent tool with a uniform envelope.
+   * @param {string} toolName - `bb_*` name.
+   * @param {string} description - model-facing contract.
+   * @param {Record<string, unknown>} properties - JSON schema properties.
+   * @param {(args: any) => Promise<unknown>} execute - implementation.
+   * @param {string} title - card title.
+   * @param {string[]} [required] - required properties.
+   */
+  /** Tool table, reused by the opt-in debug route. */
+  const tools = new Map()
+
+  const tool = (toolName, description, properties, execute, title, required = []) => {
+    tools.set(toolName, execute)
+    ctx.tools.register({
+      name: toolName,
+      description,
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties,
+        ...(required.length === 0 ? {} : { required }),
+      },
+      output: json(),
+      execute,
+      presentCall: args => present(title, args),
+    })
   }
 
-  autoArm()
+  const tabArg = { type: 'string', description: 'Tab id from bb_tabs. Defaults to the active tab.' }
 
-  ctx.tools.register({
-    name: 'bb_enable',
-    description:
-      'Give the desktop app a persistent debugging port so the built-in Browser tab can be driven by Playwright. ' +
-      'Default mode=shortcut rewrites the DSH launcher shortcut so every normal launch carries ' +
-      '--remote-debugging-port (no binary touched, survives app updates, undo with mode=shortcut undo=true). ' +
-      'mode=patch bakes the switch into app.asar instead (verified copy, backup, automatic rollback). ' +
-      'No scripts, no elevation.',
-    parameters: {
-      type: 'object',
-      additionalProperties: true,
-      properties: {
-        port: { type: 'number', description: 'Debugging port to bake in. Default 9223.' },
-        cdpWaitMs: { type: 'number', description: 'How long the watchdog waits for CDP after restarting. Default 120000.' },
-        mode: {
-          type: 'string',
-          enum: ['shortcut', 'patch'],
-          description:
-            'shortcut (default): rewrite the DSH launcher shortcut so every normal launch carries the port — no binary is touched and app updates keep working. ' +
-            'patch: bake the switch into app.asar (verified copy, backup, rollback) and wait for the app to quit.',
-        },
-        undo: { type: 'boolean', description: 'With mode=shortcut: restore the original shortcuts and remove the wrapper.' },
-      },
+  tool('bb_status',
+    'Read the shared-browser state: whether a Browser tab is attached, every open tab, and how much console/network/comment data is held. Read-only; start here when something looks disconnected.',
+    {},
+    async () => ({ version: VERSION, ...hub.status(), attachmentsDir: attachmentsRoot() }),
+    'Shared browser status')
+
+  tool('bb_tabs',
+    'List, activate, open, reload or close shared-browser tabs. The tab list is the same one the user sees in the right sidebar.',
+    {
+      action: { type: 'string', enum: ['list', 'activate', 'open', 'reload', 'close'], description: 'Operation. Default list.' },
+      tabId: tabArg,
+      url: { type: 'string', description: 'For action=open: address to open in a new tab.' },
+      background: { type: 'boolean', description: 'For action=open: open without stealing focus.' },
     },
-    output: json({}),
-    async execute(a) {
-      const app = locateApp()
-      if (!app.exeExists) throw new Error('cannot find the desktop app executable: ' + app.exe + ' (set DSH_APP_EXE to override)')
-      if (!app.asarExists) throw new Error('cannot find app.asar: ' + app.asar + ' (set DSH_ASAR_PATH to override)')
+    async (a) => {
+      const action = a.action ?? 'list'
+      if (action === 'list') return { tabs: hub.tabs, activeTabId: hub.activeTabId }
+      const value = await hub.command('tabs', { action, tabId: a.tabId ?? null, url: a.url ?? null, background: a.background === true })
+      return value
+    },
+    'Shared browser tabs',
+    [])
 
-      const port = String(a.port || new URL(ENDPOINT).port || '9223')
-      const dir0 = join(tmpdir(), 'dsh-shared-browser')
-      mkdirSync(dir0, { recursive: true })
-      const recordPath = join(dir0, 'shortcut-record.json')
+  tool('bb_open',
+    'Open an address in the shared browser and wait until it is usable. If no Browser tab exists yet, this opens one. Returns the tab id, final URL and title.',
+    {
+      url: { type: 'string', description: 'http(s) address to open.' },
+      newTab: { type: 'boolean', description: 'Open in a new tab instead of the active one.' },
+      waitMs: { type: 'number', description: 'How long to wait for load. Default 15000.' },
+    },
+    async (a) => hub.command('open', { url: a.url, newTab: a.newTab === true, waitMs: a.waitMs ?? 15000 }, { timeoutMs: (a.waitMs ?? 15000) + 10000 }),
+    'Open in shared browser',
+    ['url'])
 
-      if ((a.mode || 'shortcut') === 'shortcut') {
-        if (a.undo) {
-          const undone = uninstallShortcut({ recordPath })
-          return { mode: 'shortcut', undone: true, restored: undone.restored }
-        }
-        const record = installShortcut({ exe: app.exe, port, recordPath })
-        return {
-          mode: 'shortcut',
-          installed: true,
-          port,
-          wrapper: record.wrapper,
-          shortcuts: record.shortcuts.map((x) => x.lnk),
-          next:
-            record.shortcuts.length === 0
-              ? 'No DeepSeek shortcut was found. Use the wrapper directly: ' + record.wrapper
-              : 'Open DSH from its shortcut from now on (close it first if it is running): the next launch carries --remote-debugging-port=' +
-                port +
-                '. Nothing was written into app.asar.',
-        }
+  tool('bb_navigate',
+    'Navigate the active tab (or tabId) to an address, with optional back/forward/reload.',
+    {
+      url: { type: 'string', description: 'Address to load. Omit for a history move.' },
+      action: { type: 'string', enum: ['goto', 'back', 'forward', 'reload', 'stop'], description: 'Default goto when url is given, otherwise reload.' },
+      tabId: tabArg,
+      waitMs: { type: 'number', description: 'How long to wait for load. Default 15000.' },
+    },
+    async (a) => hub.command('navigate', { ...a }, { timeoutMs: (a.waitMs ?? 15000) + 10000 }),
+    'Navigate shared browser')
+
+  tool('bb_snapshot',
+    'Read the page as an accessibility-style tree with stable element refs (e1, e2, …). Use the refs with bb_click/bb_type instead of guessing selectors.',
+    {
+      tabId: tabArg,
+      interactiveOnly: { type: 'boolean', description: 'Only interactive and labeled elements. Default false.' },
+      maxChars: { type: 'number', description: 'Budget for the returned text. Default 20000.' },
+      maxDepth: { type: 'number', description: 'DOM depth cap. Default 12.' },
+    },
+    async (a) => hub.command('snapshot', { ...a }, { timeoutMs: 15000 }),
+    'Snapshot page')
+
+  tool('bb_text',
+    'Extract readable text from the page (main content first), optionally limited to one element.',
+    {
+      tabId: tabArg,
+      selector: { type: 'string', description: 'Optional CSS selector to read instead of the whole page.' },
+      maxChars: { type: 'number', description: 'Default 20000.' },
+    },
+    async (a) => hub.command('text', { ...a }, { timeoutMs: 15000 }),
+    'Read page text')
+
+  tool('bb_click',
+    'Click an element in the shared browser: by ref from bb_snapshot, by CSS selector, or at viewport coordinates. The user sees the real click.',
+    {
+      ref: { type: 'string', description: 'Element ref from bb_snapshot (e12).' },
+      selector: { type: 'string', description: 'CSS selector, or text= prefix for text match.' },
+      x: { type: 'number', description: 'Viewport X for a coordinate click.' },
+      y: { type: 'number', description: 'Viewport Y for a coordinate click.' },
+      button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Default left.' },
+      clickCount: { type: 'number', description: 'Default 1; 2 double-clicks.' },
+      tabId: tabArg,
+    },
+    async (a) => hub.command('click', { ...a }, { timeoutMs: 15000 }),
+    'Click in shared browser')
+
+  tool('bb_type',
+    'Type text into a focused or selected control (ref/selector), optionally pressing Enter. Fires real input events, so site listeners run.',
+    {
+      ref: { type: 'string', description: 'Element ref from bb_snapshot.' },
+      selector: { type: 'string', description: 'CSS selector or text= match.' },
+      text: { type: 'string', description: 'Text to type.' },
+      clear: { type: 'boolean', description: 'Clear the field first. Default true.' },
+      submit: { type: 'boolean', description: 'Press Enter afterwards.' },
+      delayMs: { type: 'number', description: 'Per-character delay. Default 8.' },
+      tabId: tabArg,
+    },
+    async (a) => hub.command('type', { ...a }, { timeoutMs: 20000 }),
+    'Type in shared browser',
+    ['text'])
+
+  tool('bb_press',
+    'Press a key or chord in the page (Enter, Tab, Escape, Control+A, Meta+K, ArrowDown, F5 …).',
+    {
+      keys: { type: 'string', description: 'Key or chord, e.g. "Control+Shift+R".' },
+      tabId: tabArg,
+    },
+    async (a) => hub.command('press', { ...a }, { timeoutMs: 10000 }),
+    'Press keys',
+    ['keys'])
+
+  tool('bb_wait',
+    'Wait for a selector, a text snippet, or the document to reach readyState complete.',
+    {
+      selector: { type: 'string', description: 'CSS selector to wait for.' },
+      text: { type: 'string', description: 'Visible text to wait for.' },
+      state: { type: 'string', enum: ['visible', 'hidden'], description: 'Default visible.' },
+      timeoutMs: { type: 'number', description: 'Default 10000.' },
+      tabId: tabArg,
+    },
+    async (a) => hub.command('wait', { ...a }, { timeoutMs: (a.timeoutMs ?? 10000) + 5000 }),
+    'Wait for page state')
+
+  tool('bb_eval',
+    'Evaluate JavaScript in the page main world and return its value. Use for data the snapshot cannot express; prefer bb_text/bb_snapshot for reading.',
+    {
+      expression: { type: 'string', description: 'Expression or body to evaluate. A Promise is awaited.' },
+      awaitPromise: { type: 'boolean', description: 'Default true.' },
+      tabId: tabArg,
+    },
+    async (a) => hub.command('evaluate', { ...a }, { timeoutMs: 20000 }),
+    'Evaluate in page',
+    ['expression'])
+
+  tool('bb_screenshot',
+    'Capture the visible tab (or one element) as a PNG and save it under the DSH home. Returns the absolute path, so you can attach it or read it back.',
+    {
+      selector: { type: 'string', description: 'Capture only this element.' },
+      fullPage: { type: 'boolean', description: 'Capture the whole scrollable page. Default false.' },
+      name: { type: 'string', description: 'File name prefix.' },
+      tabId: tabArg,
+    },
+    async (a) => {
+      const capture = await hub.command('screenshot', { ...a }, { timeoutMs: 30000 })
+      return storeCapture(capture, 'screenshot')
+    },
+    'Screenshot shared browser')
+
+  tool('bb_region_screenshot',
+    'Capture a rectangle of the tab (viewport coordinates, CSS pixels) as a PNG. Use it for a region the user is talking about.',
+    {
+      x: { type: 'number', description: 'Left edge in CSS pixels.' },
+      y: { type: 'number', description: 'Top edge in CSS pixels.' },
+      width: { type: 'number', description: 'Width in CSS pixels.' },
+      height: { type: 'number', description: 'Height in CSS pixels.' },
+      name: { type: 'string', description: 'File name prefix.' },
+      tabId: tabArg,
+    },
+    async (a) => {
+      const capture = await hub.command('regionScreenshot', { ...a }, { timeoutMs: 30000 })
+      return storeCapture(capture, 'region')
+    },
+    'Region screenshot',
+    ['x', 'y', 'width', 'height'])
+
+  tool('bb_console',
+    'Read console output (console.* calls, page errors and unhandled rejections) captured from the shared browser. Newest last.',
+    {
+      level: { type: 'string', enum: ['error', 'warning', 'info', 'debug', 'verbose'], description: 'Only this level.' },
+      levelAtLeast: { type: 'string', enum: ['error', 'warning', 'info', 'debug'], description: 'This level or more severe.' },
+      limit: { type: 'number', description: 'Default 100, max 1000.' },
+      since: { type: 'number', description: 'Only entries at or after this epoch millisecond.' },
+      tabId: tabArg,
+      clear: { type: 'boolean', description: 'Drop the buffer after reading.' },
+    },
+    async (a) => {
+      const rank = { error: 0, warning: 1, info: 2, debug: 3, verbose: 4 }
+      let entries = hub.console({ level: a.level, limit: a.limit, tabId: a.tabId, since: a.since })
+      if (typeof a.levelAtLeast === 'string') {
+        const floor = rank[a.levelAtLeast] ?? 0
+        entries = entries.filter(entry => (rank[entry.level] ?? 9) <= floor)
       }
+      if (a.clear === true) hub.clear()
+      return { count: entries.length, entries }
+    },
+    'Console log')
 
-      const state = archiveState(app.asar)
-      if (state.error) throw new Error('cannot read app.asar: ' + state.error)
-      if (state.patched) {
-        return {
-          patched: true,
-          already: true,
-          asar: app.asar,
-          port: state.port,
-          hint: state.port === port ? 'app.asar already carries the switch; just (re)start the app.' : 'app.asar is patched for port ' + state.port + '; rerun with port ' + state.port + ' or patch again.',
-        }
+  tool('bb_network',
+    'Read network activity captured from the page (fetch/XHR, method, status, duration, failures). Newest last.',
+    {
+      limit: { type: 'number', description: 'Default 50.' },
+      failedOnly: { type: 'boolean', description: 'Only failed requests.' },
+      filter: { type: 'string', description: 'Substring of the URL.' },
+    },
+    async (a) => {
+      const entries = hub.network({ limit: a.limit, failedOnly: a.failedOnly === true, filter: a.filter })
+      return { count: entries.length, entries }
+    },
+    'Network log')
+
+  tool('bb_comment',
+    'Attach a comment to an element of the shared browser, exactly as the user\'s comment tool does. Omit ref/selector to comment on the element the user picked last.',
+    {
+      ref: { type: 'string', description: 'Element ref from bb_snapshot or from bb_comments.' },
+      selector: { type: 'string', description: 'CSS selector.' },
+      note: { type: 'string', description: 'Comment body.' },
+      tabId: tabArg,
+    },
+    async (a) => {
+      const comment = await hub.command('comment', { ...a }, { timeoutMs: 15000 })
+      hub.ingest({ type: 'comment', comment })
+      return comment
+    },
+    'Comment element',
+    ['note'])
+
+  tool('bb_comments',
+    'List element comments the user left in the shared browser (and any the agent added): selector, element text, the comment body, and the screenshot when captured.',
+    {
+      selector: { type: 'string', description: 'Only comments on this selector.' },
+      tabId: tabArg,
+      limit: { type: 'number', description: 'Default 50.' },
+    },
+    async (a) => {
+      const comments = hub.commentsFor({ selector: a.selector, tabId: a.tabId, limit: a.limit })
+      return { count: comments.length, comments }
+    },
+    'Element comments')
+
+  tool('bb_find',
+    'Find text in the page and scroll to the first match, like Ctrl+F. Returns the match count and a short excerpt.',
+    {
+      text: { type: 'string', description: 'Text to find.' },
+      action: { type: 'string', enum: ['find', 'next', 'previous', 'stop'], description: 'Default find.' },
+      tabId: tabArg,
+    },
+    async (a) => hub.command('find', { ...a }, { timeoutMs: 10000 }),
+    'Find in page',
+    ['text'])
+
+  tool('bb_zoom',
+    'Set or reset the page zoom factor, like Ctrl+= / Ctrl+- / Ctrl+NumPad0.',
+    {
+      action: { type: 'string', enum: ['in', 'out', 'reset', 'set'], description: 'Default reset.' },
+      factor: { type: 'number', description: 'For action=set: 0.25 … 5.' },
+      tabId: tabArg,
+    },
+    async (a) => hub.command('zoom', { ...a }, { timeoutMs: 8000 }),
+    'Zoom page')
+
+  tool('bb_devtools',
+    'Open or close the shared browser\'s DevTools panel (console, elements, network, eval). The panel belongs to the browser UI, so the user sees the same window.',
+    {
+      action: { type: 'string', enum: ['open', 'close', 'toggle', 'status'], description: 'Default toggle.' },
+      panel: { type: 'string', enum: ['console', 'elements', 'network', 'eval'], description: 'Panel to focus.' },
+      tabId: tabArg,
+    },
+    async (a) => hub.command('devtools', { ...a }, { timeoutMs: 8000 }),
+    'DevTools panel')
+
+  tool('bb_storage',
+    'Inspect or clear the site storage of the shared browser: cookies, localStorage, sessionStorage, caches and IndexedDB for the current origin (or every origin with scope=all).',
+    {
+      action: { type: 'string', enum: ['status', 'clear'], description: 'Default status.' },
+      scope: { type: 'string', enum: ['origin', 'all'], description: 'Default all, matching the menu item.' },
+      tabId: tabArg,
+    },
+    async (a) => hub.command('storage', { ...a }, { timeoutMs: 15000 }),
+    'Site storage')
+
+  tool('bb_permissions',
+    'Report which site permissions the shared browser grants (camera, microphone, notifications, geolocation, popups, downloads) and why they are refused, plus the site the tab is on.',
+    { tabId: tabArg },
+    async (a) => hub.command('permissions', { ...a }, { timeoutMs: 8000 }),
+    'Site permissions')
+
+  tool('bb_history',
+    'Read or clear the shared browser history (the same list the browser menu shows).',
+    {
+      action: { type: 'string', enum: ['list', 'clear'], description: 'Default list.' },
+      query: { type: 'string', description: 'Filter by URL or title substring.' },
+      limit: { type: 'number', description: 'Default 50.' },
+    },
+    async (a) => hub.command('history', { ...a }, { timeoutMs: 8000 }),
+    'Browser history')
+
+  tool('bb_emulate',
+    'Switch the shared browser into device emulation (viewport size, device pixel ratio, touch, user agent) or leave it with mode=none. Used by the menu item 设备仿真.',
+    {
+      device: { type: 'string', enum: ['none', 'iphone-14', 'pixel-7', 'ipad-mini', 'galaxy-s23', 'desktop-720'], description: 'Preset. Default none.' },
+      width: { type: 'number', description: 'Custom width in CSS pixels.' },
+      height: { type: 'number', description: 'Custom height in CSS pixels.' },
+      tabId: tabArg,
+    },
+    async (a) => hub.command('emulate', { ...a }, { timeoutMs: 10000 }),
+    'Device emulation')
+
+  tool('bb_add_to_chat',
+    'Put something from the browser into the conversation as a draft attachment the user can review and send: a screenshot, a region, the picked element, or the console tail. Returns what was inserted.',
+    {
+      kind: { type: 'string', enum: ['screenshot', 'region', 'element', 'console'], description: 'What to add.' },
+      note: { type: 'string', description: 'Optional sentence to insert with it.' },
+      selector: { type: 'string', description: 'For kind=element: element to describe.' },
+      ref: { type: 'string', description: 'For kind=element: ref from bb_snapshot.' },
+      x: { type: 'number', description: 'For kind=region: left edge.' },
+      y: { type: 'number', description: 'For kind=region: top edge.' },
+      width: { type: 'number', description: 'For kind=region: width.' },
+      height: { type: 'number', description: 'For kind=region: height.' },
+      tabId: tabArg,
+    },
+    async (a) => hub.command('addToChat', { ...a }, { timeoutMs: 30000 }),
+    'Add browser content to chat',
+    ['kind'])
+
+  tool('bb_open_devtools_native',
+    'Explain how to reach the real Chromium DevTools for the app window, and report whether a remote debugging port is already reachable. Read-only.',
+    {},
+    async () => {
+      const probe = async (port) => fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(800) })
+        .then(async response => (response.ok ? { port, ok: true, info: await response.json() } : { port, ok: false }))
+        .catch(() => ({ port, ok: false }))
+      const [first, second] = await Promise.all([probe(9223), probe(9222)])
+      const reachable = [first, second].filter(entry => entry.ok)
+      return {
+        reachable,
+        note: reachable.length === 0
+          ? 'The packaged app disables guest DevTools (devTools: !app.isPackaged). Use the in-app panel from bb_devtools; a native window needs a launch with --remote-debugging-port=9222.'
+          : 'A debugging endpoint is reachable; open chrome://inspect or connect Playwright to it.',
+        inAppPanel: 'bb_devtools action=open',
       }
+    },
+    'Native DevTools availability')
 
-      const dir = join(tmpdir(), 'dsh-shared-browser')
-      mkdirSync(dir, { recursive: true })
-      const statusPath = join(dir, 'arm-status.json')
-      if (existsSync(statusPath)) {
-        try {
-          const prev = JSON.parse(readFileSync(statusPath, 'utf8'))
-          const ageMin = (Date.now() - Date.parse(prev.at || 0)) / 60000
-          if (prev.state === 'armed' && ageMin < 20 && pidAlive(prev.pid)) {
-            return { armed: true, alreadyArmed: true, pid: prev.pid, statusPath, ageMinutes: Math.round(ageMin), next: 'quit the app from the tray; the watchdog is already waiting.' }
-          }
-        } catch {}
-      }
-
-      return await armPatch({ port, cdpWaitMs: a.cdpWaitMs })
-    },
-    presentCall: () => present('Enable built-in browser automation'),
-  })
-
-  ctx.tools.register({
-    name: 'bb_status',
-    description: 'Check whether the DSH desktop app exposes its built-in Browser tab to automation (CDP on 127.0.0.1:9223) and list the pages Playwright can see. Read-only.',
-    parameters: { type: 'object', additionalProperties: true, properties: {} },
-    output: json({}),
-    async execute() {
-      const app = locateApp()
-      const out = { endpoint: ENDPOINT, patch: patchState, app: { ...app, archive: archiveState(app.asar) } }
-      try {
-        const b = await browser()
-        out.connected = true
-        out.pages = []
-        for (const c of b.contexts()) for (const p of c.pages()) out.pages.push({ url: p.url(), web: isWebPage(p.url()), title: await p.title().catch(() => '') })
-      } catch (error) {
-        out.connected = false
-        out.error = error.message
-      }
-      return out
-    },
-    presentCall: () => present('Built-in browser status'),
-  })
-
-  ctx.tools.register({
-    name: 'bb_reconnect',
-    description: 'Drop the cached CDP connection and reconnect. Use after the desktop app was restarted.',
-    parameters: { type: 'object', additionalProperties: true, properties: {} },
-    output: json({}),
-    async execute() { await resetBrowser(); return { ok: true, endpoint: ENDPOINT } },
-    presentCall: () => present('Reconnect built-in browser'),
-  })
-
-  ctx.tools.register({
-    name: 'bb_open',
-    description: 'Navigate the built-in Browser tab to a URL. The user watches the same tab, so this is a shared, visible navigation. Use `match` when several tabs are open.',
-    parameters: {
-      type: 'object',
-      additionalProperties: true,
-      properties: {
-        url: { type: 'string', description: 'Absolute http(s) URL.' },
-        match: { type: 'string', description: 'Only use a tab whose current URL contains this text.' },
-        waitUntil: { type: 'string', description: 'load (default) | domcontentloaded | networkidle' },
-        timeoutMs: { type: 'number', description: 'Default 30000.' },
-      },
-      required: ['url'],
-    },
-    output: json({}),
-    async execute(a) {
-      let page
-      let createdTab = false
-      try {
-        page = await pickPage(a.match)
-      } catch (error) {
-        if (!/no web page found/.test(String(error && error.message))) throw error
-        page = await openTabThroughAddressBar(a.url)
-        createdTab = true
-      }
-      const response = createdTab ? null : await page.goto(a.url, { waitUntil: a.waitUntil || 'load', timeout: a.timeoutMs || 30000 })
-      return { url: page.url(), title: await page.title(), status: response ? response.status() : null, createdTab }
-    },
-    presentCall: (a) => present('Open in built-in browser', a),
-  })
-
-  ctx.tools.register({
-    name: 'bb_snapshot',
-    description: 'List the interactive elements of the current page with short refs (e1, e2, ...) plus a text excerpt. Pass those refs to bb_click / bb_type. Re-snapshot after the page changes.',
-    parameters: {
-      type: 'object',
-      additionalProperties: true,
-      properties: {
-        match: { type: 'string', description: 'Only use a tab whose URL contains this text.' },
-        limit: { type: 'number', description: 'Max elements, default 60.' },
-      },
-    },
-    output: json({}),
-    async execute(a) {
-      const page = await pickPage(a.match)
-      const data = await snapshot(page, a.limit)
-      return clean({ url: page.url(), title: await page.title(), elements: data.items, text: data.text })
-    },
-    presentCall: (a) => present('Snapshot built-in browser', a),
-  })
-
-  ctx.tools.register({
-    name: 'bb_click',
-    description: 'Click an element in the built-in Browser tab, by snapshot ref (e3) or CSS selector. A human clicking the same spot would do the same thing.',
-    parameters: {
-      type: 'object',
-      additionalProperties: true,
-      properties: {
-        target: { type: 'string', description: 'Snapshot ref (eN) or CSS selector.' },
-        match: { type: 'string', description: 'Only use a tab whose URL contains this text.' },
-        timeoutMs: { type: 'number', description: 'Default 15000.' },
-      },
-      required: ['target'],
-    },
-    output: json({}),
-    async execute(a) {
-      const page = await pickPage(a.match)
-      await locator(page, a.target).click({ timeout: a.timeoutMs || 15000 })
-      await page.waitForTimeout(400)
-      return { clicked: a.target, url: page.url(), title: await page.title() }
-    },
-    presentCall: (a) => present('Click in built-in browser', a),
-  })
-
-  ctx.tools.register({
-    name: 'bb_type',
-    description: 'Type text into a field in the built-in Browser tab (ref or CSS selector). With submit:true it presses Enter afterwards. Characters are inserted directly, so Chinese text is fine.',
-    parameters: {
-      type: 'object',
-      additionalProperties: true,
-      properties: {
-        target: { type: 'string', description: 'Snapshot ref (eN) or CSS selector.' },
-        text: { type: 'string', description: 'Text to type.' },
-        submit: { type: 'boolean', description: 'Press Enter after typing. Default false.' },
-        match: { type: 'string', description: 'Only use a tab whose URL contains this text.' },
-        timeoutMs: { type: 'number', description: 'Default 15000.' },
-      },
-      required: ['target', 'text'],
-    },
-    output: json({}),
-    async execute(a) {
-      const page = await pickPage(a.match)
-      const el = locator(page, a.target)
-      await el.click({ timeout: a.timeoutMs || 15000 })
-      await el.fill(a.text, { timeout: a.timeoutMs || 15000 })
-      if (a.submit) {
-        await el.press('Enter')
-        await page.waitForTimeout(1200)
-      }
-      return clean({ target: a.target, value: await el.inputValue().catch(() => null), submitted: !!a.submit, url: page.url() })
-    },
-    presentCall: (a) => present('Type in built-in browser', a),
-  })
-
-  ctx.tools.register({
-    name: 'bb_press',
-    description: 'Press a key or chord in the built-in Browser tab (Enter, Escape, PageDown, Control+A, ...).',
-    parameters: {
-      type: 'object',
-      additionalProperties: true,
-      properties: {
-        key: { type: 'string', description: 'Playwright key name.' },
-        match: { type: 'string', description: 'Only use a tab whose URL contains this text.' },
-      },
-      required: ['key'],
-    },
-    output: json({}),
-    async execute(a) {
-      const page = await pickPage(a.match)
-      await page.keyboard.press(a.key)
-      await page.waitForTimeout(400)
-      return { pressed: a.key, url: page.url() }
-    },
-    presentCall: (a) => present('Press key in built-in browser', a),
-  })
-
-  ctx.tools.register({
-    name: 'bb_wait',
-    description: 'Wait until some text appears or an element becomes visible in the built-in Browser tab.',
-    parameters: {
-      type: 'object',
-      additionalProperties: true,
-      properties: {
-        text: { type: 'string', description: 'Wait for this text on the page.' },
-        selector: { type: 'string', description: 'Wait for this CSS selector to be visible.' },
-        timeoutSec: { type: 'number', description: 'Default 20.' },
-        match: { type: 'string', description: 'Only use a tab whose URL contains this text.' },
-      },
-    },
-    output: json({}),
-    async execute(a) {
-      const page = await pickPage(a.match)
-      const timeout = (a.timeoutSec || 20) * 1000
-      if (a.text) await page.getByText(a.text, { exact: false }).first().waitFor({ state: 'visible', timeout })
-      else if (a.selector) await page.locator(a.selector).first().waitFor({ state: 'visible', timeout })
-      else throw new Error('give text or selector')
-      return { ok: true, url: page.url(), title: await page.title() }
-    },
-    presentCall: (a) => present('Wait in built-in browser', a),
-  })
-
-  ctx.tools.register({
-    name: 'bb_text',
-    description: 'Read the visible text of the built-in Browser tab (whole page, or one selector). This is the page content the model quotes from.',
-    parameters: {
-      type: 'object',
-      additionalProperties: true,
-      properties: {
-        selector: { type: 'string', description: 'Optional CSS selector.' },
-        maxChars: { type: 'number', description: 'Default 12000.' },
-        match: { type: 'string', description: 'Only use a tab whose URL contains this text.' },
-      },
-    },
-    output: json({}),
-    async execute(a) {
-      const page = await pickPage(a.match)
-      const cap = a.maxChars || 12000
-      const text = a.selector
-        ? await page.locator(a.selector).first().innerText({ timeout: 15000 })
-        : await page.evaluate(() => (document.body ? document.body.innerText : ''))
-      return { url: page.url(), title: await page.title(), truncated: text.length > cap, text: text.slice(0, cap) }
-    },
-    presentCall: (a) => present('Read built-in browser', a),
-  })
-
-  ctx.tools.register({
-    name: 'bb_eval',
-    description: 'Evaluate a JavaScript expression inside the built-in Browser tab page and return its JSON value.',
-    parameters: {
-      type: 'object',
-      additionalProperties: true,
-      properties: {
-        expression: { type: 'string', description: 'Expression, e.g. document.title or [...document.querySelectorAll("h3")].map(h=>h.innerText).' },
-        match: { type: 'string', description: 'Only use a tab whose URL contains this text.' },
-      },
-      required: ['expression'],
-    },
-    output: json({}),
-    async execute(a) {
-      const page = await pickPage(a.match)
-      const value = await page.evaluate(a.expression)
-      return { url: page.url(), value }
-    },
-    presentCall: (a) => present('Evaluate in built-in browser', a),
-  })
-
-  ctx.tools.register({
-    name: 'bb_screenshot',
-    description: 'Screenshot the built-in Browser tab as it renders on screen and return the file path. The user is looking at the same pixels.',
-    parameters: {
-      type: 'object',
-      additionalProperties: true,
-      properties: {
-        path: { type: 'string', description: 'Optional absolute .png path.' },
-        fullPage: { type: 'boolean', description: 'Capture the whole scrollable page. Default false.' },
-        match: { type: 'string', description: 'Only use a tab whose URL contains this text.' },
-      },
-    },
-    output: json({}),
-    async execute(a) {
-      const page = await pickPage(a.match)
-      const dir = await shotDir()
-      const file = a.path || join(dir, 'shot-' + Date.now() + '.png')
-      await page.screenshot({ path: file, fullPage: !!a.fullPage })
-      return { path: file, url: page.url(), title: await page.title() }
-    },
-    presentCall: (a) => present('Screenshot built-in browser', a),
-  })
-
-  console.info('[dsh-shared-browser] 12 tools registered against ' + ENDPOINT)
+  // Keep the module importable in tests without a Cordis context.
+  return { hub, version: VERSION }
 }

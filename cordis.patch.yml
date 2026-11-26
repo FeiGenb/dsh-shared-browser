@@ -1,5 +1,12 @@
-# dsh-shared-browser: host-plane tools that drive the desktop app's built-in
-# Browser tab through CDP (app must run with --remote-debugging-port=9223).
+# dsh-shared-browser turns DSH's own Browser tab into the shared browser.
+#
+# Host half: /dsh-shared-browser/* routes plus the bb_* tool surface.
+# Client half: takes over the `browser` tab kind (extension priority) and draws
+# the full chrome around the same Electron <webview> the desktop shell owns.
+#
+# Nothing here edits DSH itself: the tab type is registered through the public
+# `sidebarRightTabs` registry, so removing this bundle restores the built-in
+# browser unchanged.
 - insert:
     - id: dsh-shared-browser
       name: 'dsh-shared-browser'

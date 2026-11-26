@@ -1,16 +1,25 @@
 {
   "name": "dsh-shared-browser",
-  "version": "0.4.2",
-  "description": "Drive the built-in Browser tab of DeepSeek Harness Desktop with Playwright over CDP: native pixels, shared with the user, real login state.",
+  "version": "0.5.0",
+  "description": "Turnkey browser for DeepSeek Harness: a shared Browser tab (same window the user sees) with an agent-facing tool surface, element comments, console/network capture, screenshots, region screenshots and a built-in DevTools panel.",
   "type": "module",
   "main": "index.js",
   "exports": {
-    ".": "./index.js"
+    ".": {
+      "default": "./index.js"
+    },
+    "./client": {
+      "default": "./lib/client.cjs"
+    },
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
     "lib/",
+    "locale/",
     "cordis.patch.yml",
+    "icon.svg",
     "README.md",
     "README.zh.md",
     "LICENSE"
@@ -19,12 +28,12 @@
     "dsh",
     "deepseek-harness",
     "dsh-plugin",
-    "playwright",
     "browser",
-    "cdp",
-    "electron",
-    "shared-browser",
-    "webview"
+    "webview",
+    "devtools",
+    "screenshot",
+    "comment",
+    "shared-browser"
   ],
   "license": "MIT",
   "author": {
@@ -39,18 +48,25 @@
     "url": "https://github.com/FeiGenb/dsh-shared-browser/issues"
   },
   "os": [
-    "win32"
+    "win32",
+    "darwin",
+    "linux"
   ],
   "engines": {
     "node": ">=20",
     "dsh": ">=0.2.2-rc.5 <0.3.0"
   },
-  "dependencies": {
-    "playwright-core": "^1.65.1"
-  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-browser",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
   }
 }

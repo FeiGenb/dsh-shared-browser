@@ -1,0 +1,9 @@
+{
+  "meta": {
+    "title": "Shared browser",
+    "description": "Turns DSH's Browser tab (right sidebar → Browser) into a shared desktop browser the agent can drive: back/forward/reload, zoom, find in page, device emulation, history, bookmarks, screenshots, region screenshots, element picking, element comments the agent reads, console/network capture, a DevTools panel (F12), and add-to-chat for screenshots, elements and logs. The agent uses the bb_* tools (bb_status, bb_open, bb_snapshot, bb_click, …) against the same tab you are looking at. The page runs in the desktop shell's own sandboxed guest: site permissions, downloads and popups stay refused, and the native DevTools window remains closed because the packaged shell disables it — the plugin shows its own console/elements/network panel instead. Turning the bundle off restores the stock Browser tab unchanged."
+  },
+  "browser": {
+    "label": "Browser"
+  }
+}

@@ -1,121 +1,103 @@
 # dsh-shared-browser
 
-给 **DeepSeek Harness 桌面版**加一套 Playwright 工具，直接驱动它**自带的 Browser 页签**（右侧栏按 `Ctrl+T` 打开的那个）。
+把 **DeepSeek Harness 桌面版**右侧栏的浏览器页签升级成一台真正的集成浏览器：地址栏、缩放、页内查找、设备仿真、
+历史/收藏、网站权限、清除存储、内置 DevTools 面板，外加 **截图 / 区域截图 / 元素评论 / 控制台日志直接进聊天**，
+以及 26 个让 Agent 操作**同一个页面**的 `bb_*` 工具。
 
-- **原生像素** —— 就是用户眼前那个页签，不是视频投影、不是截图流；面板多大，页面就多清晰、多大。
-- **可操作** —— `bb_*` 工具通过 CDP 用 Playwright 操作同一个页面：`goto / click / type / press / wait / text /
-  eval / screenshot`，中文输入正常。
-- **共享** —— 用户可以在同一个页签里登录、过人机验证、随手点；Agent 看到的是同一个页面、同一份登录态。
+用户看到的就是 Agent 操作的那一个页面：同一份登录态、同一份页面状态，中途可以人工登录、过人机验证、随手点。
 
 ```
-Agent ──► bb_* 工具 ──► playwright-core ──connectOverCDP──► DSH 桌面版（Electron 44 / Chrome 152）
-                                                                └── Browser 页签 = WebContentsView
-用户  ──► 同一个页签，实时可见
+用户 ─┐
+      ├─► 右侧栏 Browser 页签（Electron webview，按工作区隔离）
+Agent ─┘        ▲
+        bb_* 工具 ─┐
+                    └─ 宿主插件 /dsh-shared-browser（SSE 命令通道）─► 客户端插件（页签本体）
 ```
 
-## 环境要求
+## 开箱即用
 
-| 项目 | 取值 |
+1. 打开 **插件** → 添加插件，或 `plugin_manager install_bundle target=dsh-shared-browser`。
+2. 重启一次 DSH。
+3. 右侧栏点 **浏览器**（或 `Ctrl+T`）。工具栏、菜单、工具都已经在位。
+
+**不需要**打补丁、不需要改 `app.asar`、不需要启动参数、不需要改快捷方式。关掉这个 bundle，
+右侧栏就退回 DSH 自带的浏览器页签。
+
+## 页签里有什么
+
+| 能力 | 入口 |
 | --- | --- |
-| 操作系统 | Windows 10/11 x64 |
-| 目标应用 | DeepSeek Harness 桌面版 **0.2.2-rc.5**（Electron 44.7.0 / Chrome 152.0.7977.130） |
-| `engines.dsh` | `>=0.2.2-rc.5 <0.3.0` —— 其它桌面版本需要重新核对 asar 布局 |
-| Node（随桌面版运行时） | `>= 20`（插件调用桌面版自带的 `node.exe`） |
-| 依赖 | `playwright-core ^1.65.1`（不下载浏览器） |
+| 前进 / 后退 / 刷新 / 停止 / 地址栏 | 工具栏左侧 |
+| 缩放 50%–300% | `Ctrl+=` / `Ctrl+-` / `Ctrl+0`，或菜单「放大 / 缩小 / 重置缩放」 |
+| 页内查找（命中计数 + 上下循环 + 原生高亮） | `Ctrl+F` |
+| 设备仿真（iPhone 14 / Pixel 7 / Galaxy S23 / iPad mini / 桌面） | 菜单「设备仿真」 |
+| 历史记录 / 收藏夹 | `Ctrl+H` / `Ctrl+D`，或菜单 |
+| 网站权限、清除存储、浏览器设置 | 菜单 |
+| 截图到聊天 | 工具栏 ⤓ 或菜单「截图」 |
+| 区域截图到聊天 | 工具栏 ▣ 或菜单「区域截图」 |
+| 选取元素到聊天 / 评论元素 | 工具栏 ⌖ / ✎ |
+| 控制台日志到聊天 | 菜单「控制台日志」 |
+| DevTools 面板：控制台 / 元素 / 网络 / 运行 JS | `F12` 或工具栏 ⚙ |
+| 在外部浏览器中打开、复制地址、新建标签页 | 菜单 |
 
-## 安装
+截图、区域截图、元素评论、控制台日志都会以「引用条 + 图片/文本」的形式落在**当前会话的输入框**里，
+不会替你发送；你可以改完再发，Agent 也能直接读到元素的选择器、文本与你的评论。
 
-```bash
-# 市场 / 插件管理器
-plugin_manager install_bundle target=dsh-shared-browser@0.4.0
-# 或安装本地 tarball
-plugin_manager install_bundle target=file:C:\path\dsh-shared-browser-0.4.0.tgz
-```
-
-然后**重启一次 DSH**（托盘右键 → 退出）。这就是全部——不需要启动器、不需要参数、不需要改快捷方式。
-
-这次重启里发生的事：
-
-1. 插件加载时自动布防（日志 `[dsh-shared-browser] auto-armed watchdog …`，
-   `%TEMP%\dsh-shared-browser\arm-status.json` 变 `armed`）。
-2. 应用退出后，看门狗关掉仍占着 `app.asar` 的残留子进程 → 备份为 `app.asar.bak-<时间>` → 对副本打补丁 →
-   校验（20056 条目全量读 + 400 项内容对拍）→ 替换 → 自动拉起应用 → 等 CDP 就绪。
-3. 此后每次正常启动都自带 `--remote-debugging-port=9223`，`bb_*` 直接可用。
-
-失败自动回滚：CDP 等不到就还原备份再启动，**补丁失败不会留下坏安装**。桌面版升级会覆盖 `app.asar`（补丁丢失），
-插件下次启动会重新布防，再重启一次即可。
-
-## 原理
-
-内置 Browser 页签**不是** DOM 里的 `<iframe>`，而是主进程持有的 `WebContentsView`（CDP 里报 `type: "webview"`），
-渲染层拿不到它的 DOM，所以**唯一通道是 CDP**。
-
-1. **让应用带调试口**：补丁写入归档 `package.json#main` 指向的入口模块（当前是 `lib/main.js`），位置在模块
-   **最后一条顶层 `import` 之后**：
-
-   ```js
-   /*DSH_SHARED_BROWSER_CDP v2*/import{app as __dshCdpApp}from'electron';
-   try{const p=process.env.DSH_CDP_PORT||'9223';
-       if(!process.argv.some(a=>String(a).startsWith('--remote-debugging-port')))
-         __dshCdpApp.commandLine.appendSwitch('remote-debugging-port',p);}catch{}
-   ```
-
-2. **让 Playwright 认这个目标**：`playwright-core` 会把非 `page` 类型的 CDP 目标 detach 掉
-   （`lib/coreBundle.js` → `treatOtherAsPage`）。插件加一行受环境变量门控的判断
-   （`DSH_BUILTIN_WEBVIEW_AS_PAGE=1`），把 `webview` 当成 `page`；原文件保留为 `coreBundle.js.orig`。
-
-3. **驱动**：`bb_*` 就是对这些页面的普通 Playwright 调用，外加 `bb_snapshot` 给可交互元素打稳定引用
-   （`data-bbref`）。
-
-### 与其它同样改 app.asar 的插件共存
-
-- 目标文件来自 `package.json#main`，**不硬编码** `lib/main.js`。
-- 补丁插在 import 块之后，别的插件 prepend 的 banner/注释保持原样。
-- 标记是 `/*DSH_SHARED_BROWSER_CDP v2*/`，允许出现在文件任意位置（不再假设 byte 0）。
-- 若入口模块里**已经存在** `appendSwitch('remote-debugging-port', …)`（别的插件已开端口），补丁器
-  **一字节都不改**，返回 `foreignSwitch: true`。
-- 重复打补丁是幂等的：返回 `already: true`，归档不变。
-
-## 工具
+## Agent 工具（26 个）
 
 | 工具 | 作用 |
 | --- | --- |
-| `bb_status` | CDP 端点、playwright 补丁状态、应用/归档位置、归档状态（是否已打/端口/大小）、连接状态、已开页面 |
-| `bb_enable` | 布防看门狗（默认 `mode: 'patch'`），或改写启动器（`mode: 'shortcut'`、`undo: true`） |
-| `bb_open` | 打开/跳转页签；若还没有页签，则通过侧栏地址栏新建（返回 `createdTab: true`） |
-| `bb_snapshot` | 列出可交互元素（引用、角色、标签、文本） |
-| `bb_click` / `bb_type` / `bb_press` / `bb_wait` | 按引用或 CSS 选择器交互；`submit: true` 回车提交 |
-| `bb_text` | 读取页面文本（可指定选择器） |
-| `bb_eval` | 在页面内执行 JS |
-| `bb_screenshot` | 原生像素截图到文件（`-Path`） |
-| `bb_reconnect` | 断开并重连 CDP |
+| `bb_status` | 连接状态、页签、计数 |
+| `bb_open` / `bb_navigate` | 打开网址 / 前进后退刷新停止 |
+| `bb_tabs` | 列出、切换、新建、刷新、关闭页签 |
+| `bb_snapshot` | 可交互元素树（`e12 <button> "登录"`） |
+| `bb_text` | 页面文本 |
+| `bb_click` / `bb_type` / `bb_press` / `bb_wait` | 点击、输入、按键、等待 |
+| `bb_eval` | 在页面里执行 JavaScript |
+| `bb_screenshot` / `bb_region_screenshot` | 截图 / 区域截图（落盘并给出附件 URL） |
+| `bb_console` / `bb_network` | 控制台与网络请求缓存（宿主侧） |
+| `bb_comment` / `bb_comments` | 给元素写评论 / 读取评论 |
+| `bb_find` / `bb_zoom` / `bb_emulate` | 查找、缩放、设备仿真 |
+| `bb_devtools` / `bb_open_devtools_native` | 内置面板状态 / 探测外部 CDP |
+| `bb_storage` / `bb_permissions` / `bb_history` | 存储、权限策略、历史 |
+| `bb_add_to_chat` | 把截图 / 区域 / 元素 / 控制台日志放进输入框 |
 
-典型流程：`bb_status` →（未打补丁则 `bb_enable`，然后重启）→ `bb_open <url>` → `bb_snapshot` →
-`bb_click` / `bb_type` → `bb_screenshot`。
+工具与 UI 共用一条通路：宿主把命令经 SSE 下发给页签，页签执行后回传结果。用户不在页签上时，
+工具会明确提示“先打开 Browser 页签”。评论一旦提交，Agent 用 `bb_comments` 就能读到
+选择器、`ref`、文本、矩形与你的注释。
 
-## 环境变量
+## 兼容性
 
-| 变量 | 默认 | 含义 |
-| --- | --- | --- |
-| `DSH_CDP` | `http://127.0.0.1:9223` | `bb_*` 使用的 CDP 端点 |
-| `DSH_CDP_PORT` | `9223` | 补丁注入、看门狗等待的端口 |
-| `DSH_AUTO_ARM` | 开 | 设为 `off` 关闭加载时自动布防 |
-| `DSH_NODE` | – | 指定看门狗用的 `node.exe`（默认用桌面版运行时） |
-| `DSH_APP_EXE` / `DSH_ASAR_PATH` | 自动识别 | 覆盖应用与归档路径 |
+- **不改 DSH 本身**：没有 `app.asar` 补丁、没有二进制改动、没有全局注入。
+- 只用公开接口：页签类型注册（`priority: 'extension'` 接管 `kind: 'browser'`）、座位（slot）、
+  `window.dshDesktop.browser` 租约桥、宿主 `webServer` 路由、`ctx.tools`。
+- 只接管「浏览器」这一类页签；其它插件、其它页签类型不受影响。关闭 bundle 立即恢复内置浏览器。
+- 在 Web 版（没有桌面桥的载体）里自动让位，保留内置浏览器，不会把 UI 弄坏。
+- 样式统一挂在 `<style data-plugin="dsh-shared-browser">` 下，随插件卸载一起移除。
 
-## 安全
+## 已知限制（来自桌面壳，不是本插件）
 
-- 绝不在应用运行时改归档：替换只在应用退出后进行；替换失败会还原备份并重启应用。
-- 替换前校验：完整结构读取 + marker/开关/端口检查 + 与原文件 400 项内容对拍。
-- 归档旁保留 `app.asar.bak-<时间>`，确认健康后可自行删除。
-- 不想碰二进制可用 `shortcut` 模式。
+- 共享浏览器分区里**网站权限、下载、原生弹窗一律被拒绝**：这是 DSH 桌面壳对侧栏浏览器的固定策略。
+- 打包版壳把 guest 的 `devTools` 关掉了，所以 `openDevTools()` 不可用；本插件提供**自绘的 DevTools 面板**
+  （控制台 / 元素 / 网络 / 运行 JS）。想要原生 DevTools，用 `bb_open_devtools_native` 了解外部 CDP 方案。
+- 分区按工作区隔离且**不持久**：重启 DSH 会丢登录态，与内置浏览器行为一致。
+- 尚未支持：多窗口、书签同步、下载管理、扩展。
 
-## 卸载
+## 环境
 
-1. 卸载插件即可（不需要先跑 `bb_enable`）。
-2. 还原归档：`resources\app.asar.bak-<时间>` → `app.asar`（或重装桌面版，同样会还原补丁）。
-3. 可选：`playwright-core\lib\coreBundle.js.orig` → `coreBundle.js`。
+| 项目 | 取值 |
+| --- | --- |
+| 载体 | DSH **桌面版** 0.2.2-rc.5 及以上（Electron 44 / Chrome 152 上验证） |
+| `engines.dsh` | `>=0.2.2-rc.5 <0.3.0` |
+| 依赖 | 无（只用宿主与浏览器已有的能力） |
+
+## 调试
+
+- 宿主侧自带只读诊断路由 `GET /dsh-shared-browser/state`（连接状态、页签、计数）。
+- 需要按名字直接跑工具时，用 `DSH_SHARED_BROWSER_DEV=1` 启动 DSH，会额外注册
+  `POST /dsh-shared-browser/debug/command`（仅本机 loopback，且只在开发态存在）。
+- 客户端诊断：控制台里 `window.__dshBrowserDebug`（`session()`、`probe()`、`lastMount`）。
 
 ## 许可
 
-MIT。
+MIT
