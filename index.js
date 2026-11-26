@@ -31,7 +31,7 @@ import { ExternalBrowser, detectBrowsers, profileRoot } from './lib/external.mjs
 export const name = 'dsh-shared-browser'
 export const inject = ['tools']
 
-const VERSION = '0.5.0'
+const VERSION = '0.6.0'
 const ATTACHMENT_PREFIX = `${ROUTE_BASE}/attachment?path=`
 
 /** Tool output envelope: JSON text plus a generic card. */
