@@ -265,7 +265,25 @@ export function apply(ctx) {
       newTab: { type: 'boolean', description: 'Open in a new tab instead of the active one.' },
       waitMs: { type: 'number', description: 'How long to wait for load. Default 15000.' },
     },
-    async (a) => hub.command('open', { url: a.url, newTab: a.newTab === true, waitMs: a.waitMs ?? 15000 }, { timeoutMs: (a.waitMs ?? 15000) + 10000 }),
+    async (a) => {
+      const target = String(a.url ?? '')
+      const waitMs = a.waitMs ?? 15000
+      /* Ask the page to open a pane first: the user should not have to open the
+         browser before an Agent can use it. */
+      const ensured = await hub.command('ensure', { url: target }, { timeoutMs: 8000 }).catch(error => ({ opened: false, reason: String(error && error.message ? error.message : error) }))
+      if (ensured !== null && ensured.opened === true) {
+        /* The new pane loads `params.url` by itself; give it a moment, then report
+           the tab the client registered. */
+        const deadline = Date.now() + waitMs
+        while (Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 400))
+          const tab = hub.status().tabs.find(entry => entry.visible === true)
+          if (tab !== undefined) return { tabId: tab.id, url: tab.url || target, title: tab.title ?? '', opened: true }
+        }
+        return { opened: true, url: target, pending: true }
+      }
+      return hub.command('open', { url: target, newTab: a.newTab === true, waitMs }, { timeoutMs: waitMs + 10000 })
+    },
     'Open in shared browser',
     ['url'])
 
