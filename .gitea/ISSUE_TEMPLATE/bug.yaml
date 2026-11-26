@@ -1,0 +1,8 @@
+name: Bug
+body:
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed
+    validations:
+      required: true

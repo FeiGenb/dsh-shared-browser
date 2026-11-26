@@ -3,3 +3,6 @@ node_modules/
 .dsh-*
 app.asar.bak-*
 *.tmp
+.env*
+*.key
+*.pem

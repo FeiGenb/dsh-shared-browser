@@ -1,0 +1,8 @@
+name: Feature
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+    validations:
+      required: true
