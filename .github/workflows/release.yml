@@ -43,7 +43,7 @@ jobs:
           else
             echo "new=true" >> "$GITHUB_OUTPUT"
             echo "releasing $NAME@$VERSION"
-          fi || { echo "::error title=step:meta::reading name/version failed"; exit 1; }
+          fi
 
       - name: Pack the bundle
         if: steps.meta.outputs.new == 'true'
@@ -63,19 +63,18 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Publish to npm
-        if: steps.meta.outputs.new == 'true' && secrets.NPM_TOKEN != ''
+        if: steps.meta.outputs.new == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::notice title=npm publish skipped::The NPM_TOKEN repository secret is not set. Add a token with publish permission and 2FA bypass to publish from CI; the GitHub Release above already carries the tarball."
+            exit 0
+          fi
           set -euo pipefail
           TGZ=$(ls dist/*.tgz | head -n 1)
           echo "publishing $TGZ"
           npm publish "$TGZ" --access public --provenance=false
-
-      - name: Skip npm publish (no token)
-        if: steps.meta.outputs.new == 'true' && secrets.NPM_TOKEN == ''
-        run: |
-          echo "::notice title=npm skipped::Add the NPM_TOKEN repository secret (token with publish permission and 2FA bypass) to publish to npm from CI."
 
       - name: Publish to GitHub Packages (scoped names only)
         if: steps.meta.outputs.new == 'true' && startsWith(steps.meta.outputs.name, '@')
