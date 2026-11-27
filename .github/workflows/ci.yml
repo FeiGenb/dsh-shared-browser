@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Syntax and package checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Syntax check every JavaScript entry
+        run: |
+          set -euo pipefail
+          for f in index.js lib/*.mjs lib/*.cjs; do
+            [ -e "$f" ] || continue
+            echo "node --check $f"
+            node --check "$f"
+          done
+
+      - name: Validate the DSH plugin manifest
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('node:fs')
+          const p = require('./package.json')
+          const required = ['name', 'version', 'description', 'license', 'main', 'files', 'dsh']
+          for (const key of required) {
+            if (!p[key]) throw new Error('package.json is missing "' + key + '"')
+          }
+          if (!p.dsh.bundle || !p.dsh.bundle.patch) throw new Error('dsh.bundle.patch is missing')
+          if (!p.dsh.client || !p.dsh.client.platform) throw new Error('dsh.client.platform is missing')
+          for (const file of ['index.js', 'cordis.patch.yml', 'README.md', 'README.zh.md', 'LICENSE']) {
+            if (!fs.existsSync(file)) throw new Error('missing file: ' + file)
+          }
+          for (const entry of p.files) {
+            const probe = entry.replace(/\/$/, '')
+            if (!fs.existsSync(probe)) throw new Error('files[] entry does not exist: ' + entry)
+          }
+          console.log('manifest ok: ' + p.name + '@' + p.version)
+          NODE
+
+      - name: Pack the bundle
+        run: npm pack --pack-destination dist
+
+      - name: Show tarball contents
+        run: |
+          set -euo pipefail
+          tar -tzf dist/*.tgz | sed 's/^/  /'
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-shared-browser-tarball
+          path: dist/*.tgz
+          if-no-files-found: error
