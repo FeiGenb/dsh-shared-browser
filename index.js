@@ -25,13 +25,14 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { createRequire } from 'node:module'
 import { Hub, BridgeError, ROUTE_BASE, fence, readJson, replyError, replyJson } from './lib/bridge.mjs'
 import { ExternalBrowser, detectBrowsers, profileRoot } from './lib/external.mjs'
 
 export const name = 'dsh-shared-browser'
 export const inject = ['tools']
 
-const VERSION = '0.6.0'
+const VERSION = createRequire(import.meta.url)('./package.json').version
 const ATTACHMENT_PREFIX = `${ROUTE_BASE}/attachment?path=`
 
 /** Tool output envelope: JSON text plus a generic card. */

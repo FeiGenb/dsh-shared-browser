@@ -73,6 +73,18 @@ function syntaxCheck(files) {
   }
 }
 
+function versionCheck() {
+  console.log('version check')
+  const manifestVersion = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version
+  const clientSource = readFileSync(join(root, 'lib', 'client.cjs'), 'utf8')
+  const clientVersion = (clientSource.match(/const VERSION = '([^']+)'/) || [])[1]
+  if (clientVersion === manifestVersion) {
+    console.log('  ok    lib/client.cjs version ' + clientVersion)
+  } else {
+    fail('lib/client.cjs version ' + clientVersion + ' != package.json ' + manifestVersion)
+  }
+}
+
 function manifestCheck() {
   console.log('manifest check')
   let pkg
@@ -120,6 +132,7 @@ function manifestCheck() {
 const files = listJavaScript()
 console.log('files: ' + files.length)
 syntaxCheck(files)
+versionCheck()
 manifestCheck()
 
 if (problems.length > 0) {
