@@ -81,6 +81,8 @@ jobs:
       # Auth is the workflow GITHUB_TOKEN (packages: write). setup-node only writes
       # credentials for registry.npmjs.org, so the npm.pkg.github.com auth line is
       # appended here; that is the usual cause of a 401/403 on this registry.
+      # The npm output is captured so a failure reports its own reason as an
+      # annotation instead of a bare exit code.
       - name: Publish a scoped mirror to GitHub Packages
         if: steps.meta.outputs.new == 'true'
         env:
@@ -116,5 +118,13 @@ jobs:
           mkdir -p "$WORK/out"
           npm pack --pack-destination "$WORK/out"
           ls -l "$WORK/out"
-          npm publish "$WORK"/out/*.tgz --registry=https://npm.pkg.github.com --access public
-          echo "::notice title=GitHub Packages::published $SCOPED@${{ steps.meta.outputs.version }}"
+          LOG="$WORK/out/npm-publish.log"
+          if npm publish "$WORK"/out/*.tgz --registry=https://npm.pkg.github.com --access public --loglevel verbose >"$LOG" 2>&1; then
+            cat "$LOG"
+            echo "::notice title=GitHub Packages::published $SCOPED@${{ steps.meta.outputs.version }}"
+          else
+            tail -n 40 "$LOG" || true
+            MSG=$(tail -n 3 "$LOG" | tr '\n' ' ' | cut -c1-350)
+            echo "::error title=GitHub Packages publish failed::$MSG"
+            exit 1
+          fi
