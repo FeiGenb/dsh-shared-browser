@@ -78,9 +78,9 @@ jobs:
 
       # GitHub Packages only accepts scoped package names, so the tarball that was
       # just packed is unpacked, renamed to @feigenb/<name> and published there too.
-      # Auth is the workflow GITHUB_TOKEN (packages: write); no extra secret needed.
-      # Only the registry field is rewritten - no git object is read here, which keeps
-      # this step independent of clone depth and of the checkout layout.
+      # Auth is the workflow GITHUB_TOKEN (packages: write). setup-node only writes
+      # credentials for registry.npmjs.org, so the npm.pkg.github.com auth line is
+      # appended here; that is the usual cause of a 401/403 on this registry.
       - name: Publish a scoped mirror to GitHub Packages
         if: steps.meta.outputs.new == 'true'
         env:
@@ -92,7 +92,13 @@ jobs:
             @*) SCOPED="$PKG_NAME" ;;
             *)   SCOPED="@feigenb/$PKG_NAME" ;;
           esac
+          SCOPE=$(printf '%s' "$SCOPED" | sed 's#^\(@[^/]*\)/.*#\1#')
           SCOPED=$(printf '%s' "$SCOPED" | tr '[:upper:]' '[:lower:]')
+          echo "mirror target: $SCOPED (scope $SCOPE)"
+          {
+            echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}";
+            echo "${SCOPE}:registry=https://npm.pkg.github.com";
+          } >> "$HOME/.npmrc"
           WORK=$(mktemp -d)
           tar -xzf dist/*.tgz -C "$WORK"
           cd "$WORK/package"
