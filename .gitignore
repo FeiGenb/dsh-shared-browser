@@ -1,6 +1,7 @@
 node_modules/
 *.log
 .dsh-*
+.dsh/
 app.asar.bak-*
 *.tmp
 .env*
