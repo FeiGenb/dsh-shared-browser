@@ -24,8 +24,7 @@ agent ─┘        ▲
 2. Restart DSH once.
 3. Click **Browser** in the sidebar (or `Ctrl+T`). Toolbar, menu and tools are all there.
 
-No patching, no `app.asar` edits, no launch flags, no shortcut rewriting. Disable the bundle and the sidebar
-falls back to the DSH built-in browser.
+From then on the sidebar's Browser tab is this plugin; disable it and the tab returns to DSH's own browser tab.
 
 ## What the tab offers
 
@@ -94,8 +93,7 @@ selector, `ref`, text, rect and note — the agent can read what the user pointe
 
 ## How it works
 
-This describes the **current code** (0.6.x), not a roadmap. Everything uses public surfaces: no `app.asar`
-patching, no debugging port.
+This describes the code in 0.6.12. Every mechanism goes through DSH's public surfaces.
 
 ### 1. Three boundaries: host / renderer / page
 
@@ -192,9 +190,8 @@ DevTools, `bb_open_devtools_native` explains the external CDP route.
 
 ## Compatibility
 
-- **No DSH changes**: no `app.asar` patching, no binary edits, no global injection.
-- Public surfaces only: tab type registration (`priority: 'extension'` taking over `kind: 'browser'`), slots,
-  the `window.dshDesktop.browser` lease bridge, host `webServer` routes and `ctx.tools`.
+- **Only touches the plugin itself**: tab type registration (`priority: 'extension'` taking over `kind: 'browser'`),
+  slots, the `window.dshDesktop.browser` lease bridge, host `webServer` routes and `ctx.tools`.
 - Claims only the `browser` tab kind; other plugins and tab types are untouched. Disabling the bundle restores
   the built-in browser immediately.
 - In the Web carrier (no desktop bridge) the plugin steps aside and keeps the built-in browser intact.

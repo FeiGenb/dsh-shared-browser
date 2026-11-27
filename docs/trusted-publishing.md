@@ -42,7 +42,7 @@ Fields used for `dsh-shared-browser`:
 | Repository | `dsh-shared-browser` |
 | Workflow filename | `release.yml` (file name only) |
 | Environment name | *empty* - this workflow does not use GitHub Environments |
-| Allowed actions | `Allow npm publish` checked, `Allow npm dist-tag` unchecked |
+| Allowed actions | `Allow npm publish` checked, `Allow npm dist-tag` checked |
 
 Requirements on the workflow side:
 
@@ -74,30 +74,6 @@ To rehearse a release locally, pack it:
 ```bash
 npm run check && npm pack      # inspect the tarball, publish nothing
 ```
-
-If CI is unavailable for a long time and a release is genuinely urgent, the guard can
-be bypassed with `npm publish --ignore-scripts`; afterwards run the workflow manually
-(`workflow_dispatch`) so the tag, release and mirror are created for the same version.
-
-## Manual publish
-
-When CI is unavailable, from a checkout of the repository:
-
-```bash
-npm run check          # or: node scripts/check.mjs
-npm pack
-npm publish dsh-shared-browser-<version>.tgz --access public
-```
-
-A publish from a workstation needs a token with publish permission and 2FA bypass,
-for example in the user-level `~/.npmrc`:
-
-```ini
-registry=https://registry.npmjs.org/
-//registry.npmjs.org/:_authToken=${NPM_TOKEN}
-```
-
-Never commit a token, and never put one in the project `.npmrc`.
 
 ## Installing from the GitHub Packages mirror
 

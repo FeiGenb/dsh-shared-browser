@@ -814,7 +814,7 @@ export function apply(ctx) {
       return {
         reachable,
         note: reachable.length === 0
-          ? 'The packaged app disables guest DevTools (devTools: !app.isPackaged). Use the in-app panel from bb_devtools; a native window needs a launch with --remote-debugging-port=9222.'
+          ? 'The packaged app disables guest DevTools (devTools: !app.isPackaged). Use the in-app panel from bb_devtools; for native DevTools, move the page to the external Edge/Chrome channel with bb_external.'
           : 'A debugging endpoint is reachable; open chrome://inspect or connect Playwright to it.',
         inAppPanel: 'bb_devtools action=open',
       }
