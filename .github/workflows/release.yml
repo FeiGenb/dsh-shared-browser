@@ -76,11 +76,38 @@ jobs:
           echo "publishing $TGZ"
           npm publish "$TGZ" --access public --provenance=false
 
-      - name: Publish to GitHub Packages (scoped names only)
-        if: steps.meta.outputs.new == 'true' && startsWith(steps.meta.outputs.name, '@')
+      # GitHub Packages only accepts scoped names, so the same sources are packed a
+      # second time under @feigenb/<name> and pushed to npm.pkg.github.com. Auth uses
+      # the workflow GITHUB_TOKEN (packages: write), no extra secret required.
+      - name: Publish a scoped mirror to GitHub Packages
+        if: steps.meta.outputs.new == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHP_NAME: ${{ steps.meta.outputs.name }}
         run: |
           set -euo pipefail
-          TGZ=$(ls dist/*.tgz | head -n 1)
-          npm publish "$TGZ" --registry=https://npm.pkg.github.com --access public
+          case "$GHP_NAME" in
+            @*) SCOPED="$GHP_NAME" ;;
+            *)   SCOPED="@feigenb/$GHP_NAME" ;;
+          esac
+          if [ "${SCOPED}" != "$(echo "$SCOPED" | tr 'A-Z' 'a-z')" ]; then
+            echo "::error title=GitHub Packages::package names must be lowercase ($SCOPED)"
+            exit 1
+          fi
+          WORK=$(mktemp -d)
+          git archive HEAD | tar -x -C "$WORK"
+          cd "$WORK"
+          node - "$SCOPED" <<'NODE'
+          const fs = require('node:fs');
+          const target = process.argv[2];
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          pkg.name = target;
+          pkg.publishConfig = { ...(pkg.publishConfig || {}), registry: 'https://npm.pkg.github.com', access: 'public' };
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          console.log('mirror package:', pkg.name, pkg.version);
+          NODE
+          mkdir -p dist
+          npm pack --pack-destination dist
+          ls -l dist
+          npm publish dist/*.tgz --registry=https://npm.pkg.github.com --access public
+          echo "::notice title=GitHub Packages::published $SCOPED@${{ steps.meta.outputs.version }}"
