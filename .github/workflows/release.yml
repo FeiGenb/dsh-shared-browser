@@ -5,9 +5,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# id-token: write is required for npm trusted publishing (OIDC).
+# packages: write is required for the GitHub Packages mirror.
 permissions:
   contents: write
   packages: write
+  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -23,11 +26,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      # No registry-url here on purpose: setup-node would write a
+      # ``:_authToken=${NODE_AUTH_TOKEN}`` line into .npmrc, and an unset
+      # variable breaks the OIDC publish path.
       - name: Set up Node 22
         uses: actions/setup-node@v5
         with:
           node-version: '22'
-          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for trusted publishing
+        run: |
+          npm install -g npm@^11
+          npm --version
 
       - name: Read name and version
         id: meta
@@ -62,26 +72,51 @@ jobs:
           files: dist/*.tgz
           fail_on_unmatched_files: true
 
+      # npm trusted publishing: npm exchanges the Actions OIDC token for a
+      # short-lived registry credential, so no long-lived npm token is needed.
+      # The NPM_TOKEN secret is still used as a fallback if the OIDC handshake
+      # fails, so a connection problem never blocks a release.
       - name: Publish to npm
         if: steps.meta.outputs.new == 'true'
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          FALLBACK_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::notice title=npm publish skipped::The NPM_TOKEN repository secret is not set. Add a token with publish permission and 2FA bypass to publish from CI; the GitHub Release above already carries the tarball."
+          set -uo pipefail
+          TGZ=$(ls dist/*.tgz | head -n 1)
+          LOG="$RUNNER_TEMP/npm-publish.log"
+          echo "publishing $TGZ"
+          if npm publish "$TGZ" --registry=https://registry.npmjs.org/ --access public --loglevel verbose >"$LOG" 2>&1; then
+            cat "$LOG"
+            echo "::notice title=npm::published ${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }} via OIDC trusted publishing"
             exit 0
           fi
-          set -euo pipefail
-          TGZ=$(ls dist/*.tgz | head -n 1)
-          echo "publishing $TGZ"
-          npm publish "$TGZ" --access public --provenance=false
+          echo "----- OIDC publish failed (last 40 lines) -----"
+          tail -n 40 "$LOG" || true
+          MSG=$(grep -i 'npm error' "$LOG" | grep -v 'complete log of this run' | head -n 5 | tr '\n' ' | ' | cut -c1-600)
+          echo "::warning title=OIDC publish failed::${MSG:-no npm error line}"
+          if [ -z "${FALLBACK_TOKEN:-}" ]; then
+            echo "::error title=npm publish failed::OIDC publish failed and the NPM_TOKEN secret is not set"
+            exit 1
+          fi
+          echo "retrying with the NPM_TOKEN secret"
+          NPMRC="$RUNNER_TEMP/npmrc"
+          umask 077
+          printf 'registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=%s\n' "$FALLBACK_TOKEN" > "$NPMRC"
+          if npm publish "$TGZ" --userconfig "$NPMRC" --registry=https://registry.npmjs.org/ --access public --loglevel verbose >"$LOG.fallback" 2>&1; then
+            tail -n 20 "$LOG.fallback"
+            echo "::notice title=npm::published ${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }} with the NPM_TOKEN fallback"
+          else
+            echo "----- token publish failed (last 40 lines) -----"
+            tail -n 40 "$LOG.fallback" || true
+            MSG=$(grep -i 'npm error' "$LOG.fallback" | grep -v 'complete log of this run' | head -n 5 | tr '\n' ' | ' | cut -c1-600)
+            echo "::error title=npm publish failed::${MSG:-npm publish failed}"
+            exit 1
+          fi
 
       # GitHub Packages only accepts scoped package names, so the tarball that was
       # just packed is unpacked, renamed to @feigenb/<name> and published there too.
-      # Auth is the workflow GITHUB_TOKEN (packages: write). setup-node's own config
-      # file is not guaranteed to carry an npm.pkg.github.com credential, so a
-      # dedicated npmrc is generated and passed with --userconfig, which cannot be
-      # overridden by any environment-level npm config.
+      # Auth is the workflow GITHUB_TOKEN (packages: write); a dedicated npmrc is
+      # passed with --userconfig so no environment-level npm config can override it.
       - name: Publish a scoped mirror to GitHub Packages
         if: steps.meta.outputs.new == 'true'
         env:
