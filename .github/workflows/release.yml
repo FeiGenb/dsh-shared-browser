@@ -17,8 +17,6 @@ jobs:
   release:
     name: Tag, release and publish
     runs-on: ubuntu-latest
-    env:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -45,12 +43,12 @@ jobs:
           else
             echo "new=true" >> "$GITHUB_OUTPUT"
             echo "releasing $NAME@$VERSION"
-          fi
+          fi || { echo "::error title=step:meta::reading name/version failed"; exit 1; }
 
       - name: Pack the bundle
         if: steps.meta.outputs.new == 'true'
         run: |
-          set -euo pipefail
+          mkdir -p dist
           npm pack --pack-destination dist
           ls -l dist
 
@@ -65,16 +63,19 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Publish to npm
-        if: steps.meta.outputs.new == 'true'
+        if: steps.meta.outputs.new == 'true' && secrets.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${NPM_TOKEN}" ]; then
-            echo "::notice title=npm skipped::Add the NPM_TOKEN repository secret (a publish token with 2FA bypass) to publish to npm from CI. The GitHub Release above already carries the bundle."
-            exit 0
-          fi
           TGZ=$(ls dist/*.tgz | head -n 1)
           echo "publishing $TGZ"
-          NODE_AUTH_TOKEN="$NPM_TOKEN" npm publish "$TGZ" --access public
+          npm publish "$TGZ" --access public --provenance=false
+
+      - name: Skip npm publish (no token)
+        if: steps.meta.outputs.new == 'true' && secrets.NPM_TOKEN == ''
+        run: |
+          echo "::notice title=npm skipped::Add the NPM_TOKEN repository secret (token with publish permission and 2FA bypass) to publish to npm from CI."
 
       - name: Publish to GitHub Packages (scoped names only)
         if: steps.meta.outputs.new == 'true' && startsWith(steps.meta.outputs.name, '@')
