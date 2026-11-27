@@ -41,7 +41,8 @@
   ],
   "license": "MIT",
   "author": {
-    "name": "FeiGenb"
+    "name": "FeiGenb",
+    "url": "https://github.com/FeiGenb"
   },
   "repository": {
     "type": "git",
@@ -50,6 +51,10 @@
   "homepage": "https://github.com/FeiGenb/dsh-shared-browser#readme",
   "bugs": {
     "url": "https://github.com/FeiGenb/dsh-shared-browser/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "os": [
     "win32",
