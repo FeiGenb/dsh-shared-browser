@@ -24,19 +24,25 @@ jobs:
 
       - name: Show the toolchain
         run: |
-          node --version
-          npm --version
+          node --version || { echo "::error title=step:toolchain::node --version failed"; exit 1; }
+          npm --version || { echo "::error title=step:toolchain::npm --version failed"; exit 1; }
           pwd
           ls -la
 
       - name: Parse every shipped JavaScript file and validate the manifest
-        run: node scripts/check.mjs
+        run: node scripts/check.mjs || { echo "::error title=step:self-check::scripts/check.mjs failed"; exit 1; }
 
       - name: Pack the bundle
-        run: npm pack --pack-destination dist
+        run: |
+          mkdir -p dist
+          npm pack --pack-destination dist || { echo "::error title=step:pack::npm pack failed"; exit 1; }
+          ls -l dist
 
       - name: Show tarball contents
-        run: tar -tzf dist/*.tgz | sed 's/^/  /'
+        run: |
+          set -e
+          ls -l dist
+          tar -tzf dist/*.tgz | sed 's/^/  /' || { echo "::error title=step:tarball::tar listing failed"; exit 1; }
 
       - name: Upload tarball
         uses: actions/upload-artifact@v4
