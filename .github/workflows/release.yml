@@ -17,16 +17,18 @@ jobs:
   release:
     name: Tag, release and publish
     runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Set up Node 20
-        uses: actions/setup-node@v4
+      - name: Set up Node 22
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: https://registry.npmjs.org
 
       - name: Read name and version
@@ -63,19 +65,16 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Publish to npm
-        if: steps.meta.outputs.new == 'true' && secrets.NPM_TOKEN != ''
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        if: steps.meta.outputs.new == 'true'
         run: |
           set -euo pipefail
+          if [ -z "${NPM_TOKEN}" ]; then
+            echo "::notice title=npm skipped::Add the NPM_TOKEN repository secret (a publish token with 2FA bypass) to publish to npm from CI. The GitHub Release above already carries the bundle."
+            exit 0
+          fi
           TGZ=$(ls dist/*.tgz | head -n 1)
           echo "publishing $TGZ"
-          npm publish "$TGZ" --access public --provenance=false
-
-      - name: Skip npm publish (no token)
-        if: steps.meta.outputs.new == 'true' && secrets.NPM_TOKEN == ''
-        run: |
-          echo "::notice title=npm skipped::Add the NPM_TOKEN repository secret (token with publish permission and 2FA bypass) to publish to npm from CI."
+          NODE_AUTH_TOKEN="$NPM_TOKEN" npm publish "$TGZ" --access public
 
       - name: Publish to GitHub Packages (scoped names only)
         if: steps.meta.outputs.new == 'true' && startsWith(steps.meta.outputs.name, '@')

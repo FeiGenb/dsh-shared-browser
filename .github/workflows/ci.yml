@@ -15,20 +15,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Set up Node 20
-        uses: actions/setup-node@v4
+      - name: Set up Node 22
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Syntax check every JavaScript entry
         run: |
           set -euo pipefail
+          tmpdir="$(mktemp -d)"
           for f in index.js lib/*.mjs lib/*.cjs; do
             [ -e "$f" ] || continue
-            echo "node --check $f"
-            node --check "$f"
+            case "$f" in
+              *.cjs)
+                echo "node --check $f (commonjs)"
+                node --check "$f"
+                ;;
+              *)
+                # this package is ESM ("type": "module"); node --check only parses
+                # CommonJS unless the file ends in .mjs, so check a temporary copy.
+                echo "node --check $f (esm)"
+                cp "$f" "$tmpdir/check.mjs"
+                node --check "$tmpdir/check.mjs"
+                ;;
+            esac
           done
 
       - name: Validate the DSH plugin manifest
