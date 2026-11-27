@@ -90,7 +90,7 @@ jobs:
             @*) SCOPED="$GHP_NAME" ;;
             *)   SCOPED="@feigenb/$GHP_NAME" ;;
           esac
-          if [ "${SCOPED}" != "$(echo "$SCOPED" | tr 'A-Z' 'a-z')" ]; then
+          if [ "$SCOPED" != "$(echo "$SCOPED" | tr 'A-Z' 'a-z')" ]; then
             echo "::error title=GitHub Packages::package names must be lowercase ($SCOPED)"
             exit 1
           fi
