@@ -22,56 +22,21 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Syntax check every JavaScript entry
+      - name: Show the toolchain
         run: |
-          set -euo pipefail
-          tmpdir="$(mktemp -d)"
-          for f in index.js lib/*.mjs lib/*.cjs; do
-            [ -e "$f" ] || continue
-            case "$f" in
-              *.cjs)
-                echo "node --check $f (commonjs)"
-                node --check "$f"
-                ;;
-              *)
-                # this package is ESM ("type": "module"); node --check only parses
-                # CommonJS unless the file ends in .mjs, so check a temporary copy.
-                echo "node --check $f (esm)"
-                cp "$f" "$tmpdir/check.mjs"
-                node --check "$tmpdir/check.mjs"
-                ;;
-            esac
-          done
+          node --version
+          npm --version
+          pwd
+          ls -la
 
-      - name: Validate the DSH plugin manifest
-        run: |
-          set -euo pipefail
-          node - <<'NODE'
-          const fs = require('node:fs')
-          const p = require('./package.json')
-          const required = ['name', 'version', 'description', 'license', 'main', 'files', 'dsh']
-          for (const key of required) {
-            if (!p[key]) throw new Error('package.json is missing "' + key + '"')
-          }
-          if (!p.dsh.bundle || !p.dsh.bundle.patch) throw new Error('dsh.bundle.patch is missing')
-          if (!p.dsh.client || !p.dsh.client.platform) throw new Error('dsh.client.platform is missing')
-          for (const file of ['index.js', 'cordis.patch.yml', 'README.md', 'README.zh.md', 'LICENSE']) {
-            if (!fs.existsSync(file)) throw new Error('missing file: ' + file)
-          }
-          for (const entry of p.files) {
-            const probe = entry.replace(/\/$/, '')
-            if (!fs.existsSync(probe)) throw new Error('files[] entry does not exist: ' + entry)
-          }
-          console.log('manifest ok: ' + p.name + '@' + p.version)
-          NODE
+      - name: Parse every shipped JavaScript file and validate the manifest
+        run: node scripts/check.mjs
 
       - name: Pack the bundle
         run: npm pack --pack-destination dist
 
       - name: Show tarball contents
-        run: |
-          set -euo pipefail
-          tar -tzf dist/*.tgz | sed 's/^/  /'
+        run: tar -tzf dist/*.tgz | sed 's/^/  /'
 
       - name: Upload tarball
         uses: actions/upload-artifact@v4
