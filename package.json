@@ -1,6 +1,6 @@
 {
   "name": "dsh-shared-browser",
-  "version": "0.6.9",
+  "version": "0.6.10",
   "description": "Turnkey browser for DeepSeek Harness: a shared Browser tab plus an external Edge/Chrome channel, with an agent-facing tool surface, element comments, console/network capture, screenshots, region screenshots and a built-in DevTools panel.",
   "type": "module",
   "main": "index.js",
@@ -21,7 +21,7 @@
     "cordis.patch.yml",
     "icon.svg",
     "README.md",
-    "README.zh.md",
+    "README_en.md",
     "LICENSE"
   ],
   "keywords": [
@@ -77,5 +77,9 @@
         "@deepseek-ai/dsh-client-ui-conversation"
       ]
     }
+  },
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "prepublishOnly": "node scripts/publish-guard.mjs"
   }
 }

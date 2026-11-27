@@ -57,6 +57,28 @@ Requirements on the workflow side:
 If the workflow file is renamed or the repository is renamed, the connection stops
 matching and publishing fails; recreate the connection on npmjs.com in that case.
 
+## One path only: push to main
+
+A GitHub push to `main` is the single source of truth for a release. The workflow
+tags the version, creates the GitHub Release, publishes to npmjs.org and publishes
+the GitHub Packages mirror - all from the same tarball, in one run.
+
+Publishing from a workstation is therefore blocked on purpose: `package.json` has a
+`prepublishOnly` hook ([`scripts/publish-guard.mjs`](../scripts/publish-guard.mjs))
+that refuses to run outside GitHub Actions. A local `npm publish` would produce a
+version with no tag, no release and no mirror behind it, and the two registries would
+drift apart immediately.
+
+To rehearse a release locally, pack it:
+
+```bash
+npm run check && npm pack      # inspect the tarball, publish nothing
+```
+
+If CI is unavailable for a long time and a release is genuinely urgent, the guard can
+be bypassed with `npm publish --ignore-scripts`; afterwards run the workflow manually
+(`workflow_dispatch`) so the tag, release and mirror are created for the same version.
+
 ## Manual publish
 
 When CI is unavailable, from a checkout of the repository:

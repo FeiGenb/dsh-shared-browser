@@ -87,7 +87,7 @@ function manifestCheck() {
   }
   if (!pkg.dsh?.bundle?.patch) fail('package.json is missing dsh.bundle.patch')
   if (!pkg.dsh?.client?.platform) fail('package.json is missing dsh.client.platform')
-  for (const file of ['index.js', 'cordis.patch.yml', 'README.md', 'README.zh.md', 'LICENSE']) {
+  for (const file of ['index.js', 'cordis.patch.yml', 'README.md', 'README_en.md', 'LICENSE']) {
     try {
       readFileSync(join(root, file))
       console.log('  ok    ' + file)
