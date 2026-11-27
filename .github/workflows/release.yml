@@ -78,9 +78,10 @@ jobs:
 
       # GitHub Packages only accepts scoped package names, so the tarball that was
       # just packed is unpacked, renamed to @feigenb/<name> and published there too.
-      # Auth is the workflow GITHUB_TOKEN (packages: write). setup-node only writes
-      # credentials for registry.npmjs.org, so the npm.pkg.github.com auth line is
-      # appended here; a missing one is the usual cause of 401/403 here.
+      # Auth is the workflow GITHUB_TOKEN (packages: write). setup-node's own config
+      # file is not guaranteed to carry an npm.pkg.github.com credential, so a
+      # dedicated npmrc is generated and passed with --userconfig, which cannot be
+      # overridden by any environment-level npm config.
       - name: Publish a scoped mirror to GitHub Packages
         if: steps.meta.outputs.new == 'true'
         env:
@@ -95,11 +96,12 @@ jobs:
           SCOPE=$(printf '%s' "$SCOPED" | sed 's#^\(@[^/]*\)/.*#\1#')
           SCOPED=$(printf '%s' "$SCOPED" | tr '[:upper:]' '[:lower:]')
           echo "mirror target: $SCOPED (scope $SCOPE)"
-          {
-            echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}";
-            echo "${SCOPE}:registry=https://npm.pkg.github.com";
-          } >> "$HOME/.npmrc"
           WORK=$(mktemp -d)
+          NPMRC="$WORK/npmrc"
+          umask 077
+          printf '//npm.pkg.github.com/:_authToken=%s\n%s:registry=https://npm.pkg.github.com\n' \
+            "$NODE_AUTH_TOKEN" "$SCOPE" > "$NPMRC"
+          echo "npm userconfig: $NPMRC (auth line present: $(grep -c '_authToken' "$NPMRC"))"
           tar -xzf dist/*.tgz -C "$WORK"
           cd "$WORK/package"
           node -e '
@@ -114,10 +116,14 @@ jobs:
             console.log("mirror package:", pkg.name, pkg.version);
           ' "$SCOPED"
           mkdir -p "$WORK/out"
-          npm pack --pack-destination "$WORK/out"
+          npm pack --pack-destination "$WORK/out" --userconfig "$NPMRC"
           ls -l "$WORK/out"
           LOG="$WORK/out/npm-publish.log"
-          if npm publish "$WORK"/out/*.tgz --registry=https://npm.pkg.github.com --access public --loglevel verbose >"$LOG" 2>&1; then
+          if npm publish "$WORK"/out/*.tgz \
+              --userconfig "$NPMRC" \
+              --registry=https://npm.pkg.github.com \
+              --access public \
+              --loglevel verbose >"$LOG" 2>&1; then
             cat "$LOG"
             echo "::notice title=GitHub Packages::published $SCOPED@${{ steps.meta.outputs.version }}"
           else
