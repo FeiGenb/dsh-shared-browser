@@ -16,6 +16,12 @@ Agent ─┘        ▲
                     └─ 宿主插件 /dsh-shared-browser（SSE 命令通道）─► 客户端插件（页签本体）
 ```
 
+## 界面
+
+![浏览器页签：地址栏、工具栏与网页](assets/screenshot-main.png)
+
+![工具栏菜单：缩放、页内查找、设备仿真、历史、截图、DevTools](assets/screenshot-menu.png)
+
 ## 开箱即用
 
 1. 打开 **插件** → 添加插件，或 `plugin_manager install_bundle target=dsh-shared-browser`。
@@ -153,6 +159,27 @@ Agent ─┘        ▲
 - 设置 `$DSH_HOME/shared-browser/settings.json`（`channel` / `browser` / `profileDir` / `autoLaunch`），`readSettings()` + `writeSettings()` 合并写。
 - 只读诊断 `GET /dsh-shared-browser/state`；`DSH_SHARED_BROWSER_DEV=1` 时才挂 `POST /dsh-shared-browser/debug/command`（仅 loopback）。
 - 卸载是彻底的：路由注册都进了 `injected.effect(...)`，插件停用即 `hub.detach()` 并反注册；样式挂在 `<style data-plugin="dsh-shared-browser">` 下，随插件一起移除。
+
+## 会话与授权（0.7.0）
+
+每个浏览器页签属于**打开它的那个会话**。宿主侧现在按「调用工具的会话」寻址，而不是看用户此刻停在哪个会话：
+
+| 情况 | 行为 |
+| --- | --- |
+| 本会话已经开着浏览器页签 | 命令直接进这个页签 |
+| 本会话没有页签，右侧栏正显示本会话 | `bb_open` 在本会话的右侧栏开一个页签后继续 |
+| 本会话没有页签，右侧栏显示的是别的会话 | 不开新页签，返回明确错误并提示先在本会话打开一次浏览器页签；命令不会落到别的会话 |
+| `bb_tabs { action: "list" }` | 仍然列出全部页签，每项带 `session` 字段，跨会话只读可见 |
+
+`bb_status` 多返回一个 `session` 字段，说明这次调用属于哪个会话；工具参数里的 `tabId` 现在真的会定位到指定页签
+（此前会被忽略而落到当前活动页签）。
+
+宿主侧的 HTTP 路由（`/state`、`/events`、`/report`、`/command`、`/attachment` 等）不再只靠同源检查：
+每个请求先过 DSH 连接服务的会话校验（签名 cookie 或 API 凭据），未认证返回 401，连接服务不可用时返回
+503 并拒绝服务（fail-closed）。插件自己的 `Host` / `Origin` 同源检查保留为第二道防线。
+
+升级到 0.7.0 后，如果右侧栏显示的不是发起调用的会话，`bb_open` 会直接报错而不会在别的会话里开页签——
+在该会话里打开一次浏览器页签即可。
 
 ## 兼容性
 

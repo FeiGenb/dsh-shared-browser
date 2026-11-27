@@ -18,6 +18,12 @@ agent ─┘        ▲
                      └─ host plugin /dsh-shared-browser (SSE command channel) ─► client plugin (the tab body)
 ```
 
+## Screenshots
+
+![The Browser tab: address bar, toolbar and the page](assets/screenshot-main.png)
+
+![Toolbar menu: zoom, find in page, device emulation, history, screenshots, DevTools](assets/screenshot-menu.png)
+
 ## Turnkey
 
 1. Open **Plugins → Add plugin**, or `plugin_manager install_bundle target=dsh-shared-browser`.
@@ -187,6 +193,29 @@ DevTools, `bb_open_devtools_native` explains the external CDP route.
 - Teardown is complete: route registrations sit inside `injected.effect(...)`, so disabling the plugin calls
   `hub.detach()` and unregisters them; styles live under `<style data-plugin="dsh-shared-browser">` and are
   removed with the plugin.
+
+## Sessions and authorization (0.7.0)
+
+A browser tab belongs to **the session that opened it**. The Host now addresses commands by the session that
+called the tool, not by whichever session the user is looking at:
+
+| Situation | Behaviour |
+| --- | --- |
+| This session already has a browser tab | The command goes straight to that tab |
+| No tab in this session, and the right sidebar shows this session | `bb_open` opens a tab in this session's sidebar |
+| No tab in this session, and the sidebar shows another session | No tab is opened: the call fails with an explicit error asking you to open the browser tab in this session; the command never lands in another session's tab |
+| `bb_tabs { action: "list" }` | Still lists every tab, each entry carrying its `session`; read-only across sessions |
+
+`bb_status` now also reports `session`, naming the session the call belongs to, and the `tabId` argument really
+selects that tab now (it used to fall through to the active tab).
+
+The Host HTTP routes (`/state`, `/events`, `/report`, `/command`, `/attachment` and friends) no longer rely on the
+same-origin check alone: every request first passes the DSH connection service's session check (signed cookie or API
+credential). An unauthenticated request gets 401, and a carrier without that service gets 503 and is refused
+(fail-closed). The plugin's own `Host` / `Origin` fence stays as the second line of defence.
+
+After upgrading to 0.7.0, if the sidebar shows a different session than the one calling, `bb_open` reports an error
+instead of opening a tab elsewhere — open the browser tab once in that session and the call goes through.
 
 ## Compatibility
 

@@ -21,12 +21,13 @@
  * @module dsh-shared-browser
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
-import { Hub, BridgeError, ROUTE_BASE, fence, readJson, replyError, replyJson } from './lib/bridge.mjs'
+import { Hub, BridgeError, ROUTE_BASE, authorize, readJson, replyError, replyJson } from './lib/bridge.mjs'
 import { ExternalBrowser, detectBrowsers, profileRoot } from './lib/external.mjs'
 
 export const name = 'dsh-shared-browser'
@@ -34,6 +35,15 @@ export const inject = ['tools']
 
 const VERSION = createRequire(import.meta.url)('./package.json').version
 const ATTACHMENT_PREFIX = `${ROUTE_BASE}/attachment?path=`
+
+/** Per-call agent session, carried across the async tool invocation. */
+const sessionContext = new AsyncLocalStorage()
+
+/** The session that started a tool call, when the Host supplies one. */
+const sessionOf = exec => (exec && exec.agent && typeof exec.agent.id === 'string' ? exec.agent.id : '')
+
+/** The session of the tool call currently on this async branch. */
+const currentSession = () => sessionContext.getStore()?.session ?? ''
 
 /** Tool output envelope: JSON text plus a generic card. */
 const json = () => ({
@@ -119,7 +129,7 @@ async function storeCapture(capture, kind) {
  * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
  */
 export function apply(ctx) {
-  const hub = new Hub({ attachmentsDir: attachmentsRoot() })
+  const hub = new Hub({ attachmentsDir: attachmentsRoot(), session: () => currentSession() })
   /* Real Chromium channel: the user's own Edge/Chrome over CDP, used when the
      built-in webview cannot do the job (Cloudflare-class challenges, logins
      that must survive restarts, downloads, DevTools). */
@@ -136,14 +146,16 @@ export function apply(ctx) {
     })()
 
     /**
-     * Wrap a route handler with the same-origin fence and uniform error replies.
+     * Wrap a route handler with the DSH session check and uniform error replies.
      * @param {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void>} handler - body.
      * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void} guarded handler.
      */
     const route = handler => (req, res) => {
-      const refusal = fence(req, origin)
+      /* `ctx.get` reads the service without the inject requirement and returns
+         undefined when it is absent, which authorize turns into a 503. */
+      const refusal = authorize(ctx.get('connection'), req, origin)
       if (refusal !== null) {
-        replyError(res, 403, refusal, 'forbidden')
+        replyError(res, refusal.status, refusal.message, refusal.code)
         return
       }
       handler(req, res).catch((error) => {
@@ -294,7 +306,7 @@ export function apply(ctx) {
         ...(required.length === 0 ? {} : { required }),
       },
       output: json(),
-      execute,
+      execute: (args, exec) => sessionContext.run({ session: sessionOf(exec) }, () => execute(args)),
       presentCall: args => present(title, args),
     })
   }
@@ -361,13 +373,17 @@ export function apply(ctx) {
   const run = (op, args = {}, options) => {
     const tabId = args !== null && typeof args === 'object' ? args.tabId : undefined
     if (isExternal(tabId)) return external.command(op, args, tabId)
-    return hub.command(op, args, options)
+    /* An explicit tabId in the arguments picks the pane, the same way it names
+       the tab in the tool contract. */
+    const merged = { ...(options ?? {}) }
+    if (merged.tabId === undefined && typeof tabId === 'string' && tabId !== '') merged.tabId = tabId
+    return hub.command(op, args, merged)
   }
 
   tool('bb_status',
     'Read the shared-browser state: whether a Browser tab is attached, every open tab, and how much console/network/comment data is held. Read-only; start here when something looks disconnected.',
     {},
-    async () => ({ version: VERSION, ...hub.status(), attachmentsDir: attachmentsRoot(), wallPolicy: WALL_POLICY }),
+    async () => ({ version: VERSION, session: currentSession(), ...hub.status(), attachmentsDir: attachmentsRoot(), wallPolicy: WALL_POLICY }),
     'Shared browser status')
 
   tool('bb_tabs',
