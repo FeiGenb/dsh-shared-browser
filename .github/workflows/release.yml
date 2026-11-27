@@ -76,13 +76,17 @@ jobs:
       # short-lived registry credential, so no long-lived npm token is needed.
       # The NPM_TOKEN secret is still used as a fallback if the OIDC handshake
       # fails, so a connection problem never blocks a release.
+      #
+      # The tarball is passed as an absolute path: npm 11 parses a bare relative
+      # "dist/foo.tgz" as a GitHub shorthand spec (owner/repo) and tries to clone
+      # it over ssh, which fails with a confusing "Permission denied (publickey)".
       - name: Publish to npm
         if: steps.meta.outputs.new == 'true'
         env:
           FALLBACK_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -uo pipefail
-          TGZ=$(ls dist/*.tgz | head -n 1)
+          TGZ="$PWD/$(ls dist/*.tgz | head -n 1)"
           LOG="$RUNNER_TEMP/npm-publish.log"
           echo "publishing $TGZ"
           if npm publish "$TGZ" --registry=https://registry.npmjs.org/ --access public --loglevel verbose >"$LOG" 2>&1; then
