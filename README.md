@@ -90,6 +90,71 @@ Agent ─┘        ▲
 工具会明确提示“先打开 Browser 页签”。评论一旦提交，Agent 用 `bb_comments` 就能读到
 选择器、`ref`、文本、矩形与你的注释。
 
+## 实现思路
+
+下面这段对应**当前代码**（0.6.x），不是路线图。所有机制只用到公开接口，没有 `app.asar` 补丁、没有调试端口。
+
+### 1. 三层边界：宿主 / 渲染层 / 页面
+
+| 层 | 在哪 | 负责 |
+| --- | --- | --- |
+| 宿主插件 | DSH 主进程（`index.js`） | 注册 28 个 `bb_*` 工具、HTTP 路由、附件落盘、外部浏览器通道、命令排队与超时 |
+| 客户端插件 | 渲染层（`lib/client.cjs`） | 接管右侧栏「浏览器」页签、创建 `<webview>`、页面内注入、截图、评论、自绘 DevTools |
+| 页面 guest | Electron webview 里的真实网页 | 被注入一个极小 agent，负责 DOM 查询、输入事件、日志回传 |
+
+宿主拿不到 guest 的 DOM（它在另一个进程），渲染层也拿不到宿主的路由表。所以两边用一条自有通道对接，而不是靠 CDP 或改 DSH。
+
+### 2. 宿主 ↔ 页签：一条 SSE 下行 + 一条 POST 上行
+
+- `GET /dsh-shared-browser/events`：`text/event-stream`，单连接，15 秒一次 `: ping` 保活（`x-accel-buffering: no` 防代理缓冲）。连上时记 `sessionId`/`version`；连接关闭或页面刷新 → `failAll('detached')`，在途命令立刻失败，不会让工具吊死。
+- `POST /dsh-shared-browser/report`：页签回执，四类消息 `result` / `tabs` / `console` / `network` / `comments`。`result` 用命令 id 配对上在等结果的 Promise，默认 20 秒超时。
+- 同源栅栏 `fence(req, origin)` 挡掉跨站调用；错误统一成 `BridgeError` → 400/403/500。
+- 缓存都有上限并丢最旧：console 2000 条、network 600 条、comments 1000 条。所以 `bb_console` / `bb_network` 读的是**宿主缓存**，页面后来导航掉了也还在。
+
+### 3. 接管页签：注册，而不是修改
+
+- `sidebarRightTabs.register({ kind: 'browser', priority: 'extension' })` 以「扩展」优先级接管 DSH 自带的浏览器页签类型。
+- `slots.inject('sidebar.right.pane.tab')` 注入主体，`…pane.tab.title` 注入标题按钮。
+- 没有桌面桥的载体（Web 版）直接 `setFailure('no-bridge')` 让位，内置浏览器照常工作。
+
+### 4. 一个页签 = 一个租约 + 一个 webview
+
+- `window.dshDesktop.browser.acquire('cwd:<工作区>')` 拿租约，`document.createElement('webview')` 按 `name=<lease>`、`partition=<partition>` 建页签——**与 DSH 内置浏览器同一个分区**，所以登录态互通、`cwd:` 相同的工作区共用。
+- UA 走 `effectiveUserAgent()`：把 UA 里的 Electron / DSH 字样抹成标准 Chrome 版本串，避免一上来就被 Cloudflare 判成自动化客户端。
+- guest 能力逐项封装：`executeJavaScript`（注入与取值）、`setZoomFactor`（缩放）、`findInPage`/`stopFindInPage`（原生高亮与滚动）、`sendInputEvent`（鼠标/键盘/字符）、`capturePage`（3 秒超时 + `isEmpty()` 校验）、`resize`（显式给视口尺寸，因为 Electron webview 不认 CSS 缩放）。
+
+### 5. 页面内只注入一个极小 agent
+
+- 用 `executeJavaScript` 建立页内 agent，把 console、网络（fetch/XHR 包装）、评论、选元素等事件 `push` 回客户端；客户端再 `POST /report` 交给宿主。
+- 元素定位：`snapshot()` 给可交互元素打 `data-bb-ref`（`e12` 这种），`resolve()` 同时认 ref 和 CSS 选择器，所以同一个工具既能点 ref 也能点 `#submit`。
+- 点击/输入优先 `sendInputEvent`（走真实输入管线，站点的事件/焦点逻辑都会跑），只有拿不到元素时才退回 DOM 派发。
+
+### 6. 命令路由与双通道
+
+`run(op, args)` 按 `tabId` 前缀分流：`ext:` 开头 → `ExternalBrowser.command()`；其余 → `hub.command()` 走 SSE 到页签。
+
+外部通道（`lib/external.mjs`）：`detectBrowsers()` 找本机 Edge/Chrome → 带 `--remote-debugging-port` + 独立 profile（`$DSH_HOME/shared-browser/profiles/<browser>`）拉起 → `/json/list` 取 `webSocketDebuggerUrl` → `PageSession` 用裸 WebSocket 说 CDP：`Runtime.evaluate`、`Page.captureScreenshot`、`Input.dispatchMouseEvent`/`KeyEvent`、`Emulation.setDeviceMetricsOverride`。侧栏镜面 `ExternalPane` 轮询 `GET /external/frame?tab=`（宿主转 PNG）并把点击/滚轮 `POST /external/input` 转发回真实窗口。
+
+### 7. 人机验证：识别、交还，不做绕过
+
+`CHALLENGE` 正则 + `looksLikeChallenge()`（看标题，再取正文前 600 字）判断是否撞墙；命中则 `handOff()`：启动外部浏览器、选出目标页签、`hub.command('ensure', { external: 'ext:<id>' })` 让镜面页签出现，并返回 `wall: true` 加固定 `WALL_POLICY` 文案。——插件不尝试解题。
+
+### 8. 截图 / 区域截图 / 评论 / 日志进聊天
+
+- `capturePage` 的 dataURL → `storeCapture()` 落盘到 `$DSH_HOME/shared-browser/attachments`，回一个 `…/attachment?path=` URL；`/attachment` 路由做了 `resolved.startsWith(dir)` 的目录穿越防护。
+- 区域截图用同一个 `capturePage(rect)`；元素评论把 selector / ref / 文本 / 矩形一起回传，`bb_comments` 即可读。
+- `addToComposer()` 通过 `sessions` 服务，把「引用条 + File」写进对应会话的输入框草稿——**只放进去，不替你发**。
+
+### 9. 自绘 DevTools（因为壳把 guest 的 DevTools 关了）
+
+打包版把 guest 的 `devTools` 置为 false，`openDevTools()` 不可用。面板由 React 自绘：控制台 / 元素 / 网络读客户端缓存，运行面板走 `executeJavaScript`。想要原生 DevTools，用 `bb_open_devtools_native` 走外部通道的 CDP。
+
+### 10. 状态、设置与卸载
+
+- 设置 `$DSH_HOME/shared-browser/settings.json`（`channel` / `browser` / `profileDir` / `autoLaunch`），`readSettings()` + `writeSettings()` 合并写。
+- 只读诊断 `GET /dsh-shared-browser/state`；`DSH_SHARED_BROWSER_DEV=1` 时才挂 `POST /dsh-shared-browser/debug/command`（仅 loopback）。
+- 卸载是彻底的：路由注册都进了 `injected.effect(...)`，插件停用即 `hub.detach()` 并反注册；样式挂在 `<style data-plugin="dsh-shared-browser">` 下，随插件一起移除。
+
 ## 兼容性
 
 - **不改 DSH 本身**：没有 `app.asar` 补丁、没有二进制改动、没有全局注入。
